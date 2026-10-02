@@ -52,24 +52,90 @@ aborts on a collision.
 Let `H` = `C:\Users\linga\Downloads\dark-factory-wearedevs-main\dark-factory-wearedevs-main`.
 Always run harness commands with `H` as the working directory.
 
+**Tier 1 — runs today, no install.** These are the gate for every unit. Standard library only.
+
+| Purpose | Command (cwd = `C:\Users\linga\Jam\tablekeeper-submission\stage-1`) |
+|---|---|
+| Unit tests, whole suite | `python -m unittest discover -s tests -t . -v` |
+| One test module | `python -m unittest tests.test_tz -v` |
+| Start the service | `python -m app.main` (honours `PORT`, default 8080) |
+| Smoke it | `python -c "import urllib.request,json;print(urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).read())"` |
+
+**Tier 2 — grading gates, blocked on the owner.** Run with `H` as cwd once `httpx`/`pytest` exist.
+
 | Purpose | Command |
 |---|---|
 | Whole Stage 1, dev loop (service already running on 8080) | `python -m harness run --track tablekeeper --base-url http://127.0.0.1:8080 --stages 1 --out runs/<fresh>` |
-| Whole Stage 1, container path — **this is grading** | `python -m harness run --track tablekeeper --repo C:\Users\linga\Jam\tablekeeper-submission --stage 1 --mode isolated --out runs/<fresh>` |
 | One Stage 1 file | `python -m pytest tablekeeper\test\stage_1\test_reservations.py --base-url http://127.0.0.1:8080 -p harness.plugin --rootdir tablekeeper\test -q` |
-| Counts for a run | read `<fresh>\stage-1.counts.json` |
+| Counts for a run | read `runs\<fresh>\stage-1.counts.json` |
 
-## Toolchain — precondition, measured not assumed
+**Tier 3 — the grading architecture, blocked on Docker.**
+
+| Purpose | Command |
+|---|---|
+| Whole Stage 1, container path — **this is grading** | `python -m harness run --track tablekeeper --repo C:\Users\linga\Jam\tablekeeper-submission --stage 1 --mode isolated --out runs/<fresh>` |
+
+A unit is not done because Tier 1 passes. Tier 1 is the gate that lets work proceed; Tier 2 and
+Tier 3 are what decide whether it is submitted. Say which tier you reached, and never report a
+tier you did not run.
+
+## Toolchain — measured, re-checked 2026-10-02
 
 | Tool | State on this machine | Consequence |
 |---|---|---|
-| Docker | **absent** (`docker` not on PATH) | The grading command cannot run. Only the `--base-url` dev loop is available. |
-| `httpx`, `pytest` | **absent** (`ModuleNotFoundError: httpx`) | No harness command can run at all. |
-| Python | 3.10.11, `zoneinfo` + tzdata working | Fine. Container pins 3.12; host version does not gate the build. |
+| Docker | **absent** — `docker` is not on PATH | The grading command `--mode isolated` cannot run. |
+| `httpx` | **absent** — `ModuleNotFoundError: No module named 'httpx'` | The shipped harness suite cannot run. |
+| `pytest` | **absent** — `ModuleNotFoundError: No module named 'pytest'` | Rev. 2's per-unit pytest commands cannot run. |
+| Python | 3.10.11, `zoneinfo` + tzdata working | Fine. Container pins 3.12. |
 | git | 2.53.0 | Fine. |
 
-**Unit 0 is the only unit provable without this.** It is pure Python. Everything else is blocked on
-one `pip install -r harness/requirements.txt`. This is the single ask of the owner.
+Nothing has been installed since rev. 2. The single ask to the owner stands:
+`python -m pip install -r <harness>\harness\requirements.txt`, plus a Docker install.
+
+## Decision (rev. 3): the service depends on nothing
+
+Waiting on that install would idle four seats. Instead the service is built on the standard library
+only — `http.server.ThreadingHTTPServer`, `sqlite3`, `zoneinfo`, `hashlib`, `secrets`, `json`,
+`base64` — with **no pip requirement in the image at all**, and unit tests written as `unittest`
+cases driven by `urllib` against a locally started service.
+
+This is measured, not assumed. The Planner ran a probe on this machine with zero third-party
+packages installed. Observed output:
+
+```
+test_fifty_concurrent_requests_produce_no_5xx (__main__.Probe) ... ok
+test_health_and_reset_against_a_live_server (__main__.Probe) ... ok
+----------------------------------------------------------------------
+Ran 2 tests in 1.084s
+
+OK
+```
+
+That probe served `GET /health` as 200 `{"status":"ok"}`, `POST /_test/reset` as 204 writing a
+fixture inside one `BEGIN IMMEDIATE` transaction, and survived 50 concurrent requests with zero
+5xx on `ThreadingHTTPServer`.
+
+Three reasons this is the right call rather than a workaround:
+
+1. **It removes the blocker instead of waiting on it.** Every unit except the final image proof is
+   now verifiable today, with no install and no permission.
+2. **It fits the spec better.** "No outbound network at run time" becomes trivially true — there is
+   nothing to fetch. A dependency-free `python:3.12-slim` image starts inside the 60 s health
+   deadline with room to spare.
+3. **It costs nothing later.** `unittest`-style tests are collected by `pytest` unchanged, so the
+   moment `httpx` is installed the shipped harness suite runs against the same code and the same
+   tests. No rework.
+
+What it does **not** replace: `--mode isolated` is still the grading path and still needs Docker,
+and the shipped suite still needs `httpx`. Unit 8 stays blocked on the owner. Nothing else is.
+
+**Concurrency note that follows from this:** `ThreadingHTTPServer` is the default choice precisely
+because the spec requires 50 concurrent in-flight requests with no 5xx, and a single-threaded
+server would fail that immediately. Pair it with SQLite in WAL mode and `BEGIN IMMEDIATE` for
+write transactions; that is what makes §7 and §11 atomicity achievable without extra dependencies.
+
+**Language pin:** the container is `python:3.12-slim`; the host runs 3.10.11. Do not use 3.11+ only
+syntax (e.g. `typing.Self`) or the host cannot run the tests that prove the image works.
 
 ## Unit 1: Build-to-test loop, schema, reset — *reordered to first*
 
@@ -77,21 +143,24 @@ one `pip install -r harness/requirements.txt`. This is the single ask of the own
 - Files: `stage-1/Dockerfile`, `stage-1/app/main.py`, `stage-1/app/store.py`,
   `stage-1/app/schema.sql`, `stage-1/requirements.txt`
 - Depends on: nothing
-- Deliverable: a container that builds, starts, answers `/health`, and accepts `/_test/reset`.
-  This is the smallest slice that touches Docker, HTTP, SQLite and the harness at once.
-- Acceptance:
-  - `docker build -t tablekeeper-s1 C:\Users\linga\Jam\tablekeeper-submission\stage-1` exits 0.
-  - `python -m harness run --track tablekeeper --repo C:\Users\linga\Jam\tablekeeper-submission --stage 1 --mode isolated --out runs/<fresh>` reaches the suite instead of failing at
-    "docker is not installed", and `stage-1.counts.json` exists.
-  - `GET /health` returns 200 `{"status":"ok"}` inside 60 s; `POST /_test/reset` returns 204 and
-    is unauthenticated.
-  - Dockerfile pins `python:3.12-slim`, honours `-e PORT` (default 8080), binds `0.0.0.0`, and
-    installs everything at build time — no outbound request at run time.
+- Deliverable: a service that starts, answers `/health`, and accepts `/_test/reset`, plus the
+  `Dockerfile` that will carry it. Stdlib only — `ThreadingHTTPServer` + `sqlite3`, no pip
+  requirement in the image.
+- Acceptance, split by tier, and say which tier you reached:
+  - **Tier 1, runs today:** `python -m unittest tests.test_loop -v` passes, covering
+    `GET /health` → 200 `{"status":"ok"}`, `POST /_test/reset` → 204 unauthenticated writing the
+    whole fixture in one `BEGIN IMMEDIATE` transaction, repeated resets supported, and 50 concurrent
+    requests producing zero 5xx. `python -m app.main` starts and honours `PORT`.
+  - **Tier 2, blocked:** the harness suite runs against it and `runs\<fresh>\stage-1.counts.json`
+    exists.
+  - **Tier 3, blocked on Docker:** `docker build -t tablekeeper-s1 C:\Users\linga\Jam\tablekeeper-submission\stage-1`
+    exits 0, and `--mode isolated` reaches the suite instead of failing at "docker is not installed".
+  - Dockerfile pins `python:3.12-slim`, honours `-e PORT` (default 8080), binds `0.0.0.0`, copies
+    `app/`, installs nothing from the network at run time.
 
 Why first: if the build-to-test loop does not exist, no later unit can be proven and the defect
 would surface only at the end of the stage, after all nine units were written. Everything else in
-this plan is worthless without this loop. Docker being absent makes it the riskiest unknown in the
-build, not the DST arithmetic.
+this plan is worthless without this loop.
 
 ## Unit 0: DST and absolute-interval core
 
@@ -100,14 +169,13 @@ build, not the DST arithmetic.
 - Depends on: nothing (parallel to Unit 1)
 - Deliverable: pure functions for local-time resolution and half-open occupancy intervals. No HTTP,
   no DB, no import of anything outside the standard library.
-- Acceptance: `cd C:\Users\linga\Jam\tablekeeper-submission\stage-1; python -m pytest tests/test_tz.py -q`
-  passes for Europe/Berlin 2026-03-29 and 2026-10-25, America/New_York 2026-03-08 and 2026-11-01,
-  plus the §1 adjacency case where a 90-minute booking at 19:00 does not conflict with one starting
-  20:30.
+- Acceptance (Tier 1, runs today): `python -m unittest tests.test_tz -v` passes for Europe/Berlin
+  2026-03-29 and 2026-10-25, America/New_York 2026-03-08 and 2026-11-01, plus the §1 adjacency
+  case where a 90-minute booking at 19:00 does not conflict with one starting 20:30.
+  Write the tests as `unittest.TestCase`; pytest collects them unchanged later.
 
-Why second-in-line but genuinely parallel: the highest *domain* risk, and the only unit whose
-proof needs no toolchain beyond stdlib. If it is wrong, availability, booking, amendment and batch
-moves are wrong together.
+Why second-in-line but genuinely parallel: the highest *domain* risk, and it is pure. If local-time
+resolution is wrong, availability, booking, amendment and batch moves are wrong together.
 
 ## Conformance suite and one verify command
 
