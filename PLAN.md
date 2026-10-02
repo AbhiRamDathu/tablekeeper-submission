@@ -61,6 +61,21 @@ Always run harness commands with `H` as the working directory.
 | Start the service | `python -m app.main` (honours `PORT`, default 8080) |
 | Smoke it | `python -c "import urllib.request,json;print(urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).read())"` |
 
+**Gate command correction, measured on Python 3.10.11 (rev. 4).** The suite form above only works
+because `stage-1/tests/__init__.py` exists, which the Planner has now created. Verified:
+
+| Form | Result |
+|---|---|
+| `discover -s tests -t . -v` **without** `__init__.py` | `ImportError: Start directory is not importable` |
+| `discover -s tests -t . -v` **with** `__init__.py` | runs the suite, OK |
+| `discover -s . -p "test_*.py" -v` without `__init__.py` | **exits 0 after running 0 tests — a silent false green** |
+| `discover -s tests -t tests -v` without `__init__.py` | works |
+| `python -m unittest tests.test_tz -v` without `__init__.py` | works |
+
+Two consequences. Never use the `-s . -p` form: it reports success without running anything, which
+is precisely the false pass this plan forbids. And treat "Ran 0 tests" as a failure in any report —
+a Tier 1 result of zero tests is not a pass, it is an unrun gate.
+
 **Tier 2 — grading gates, blocked on the owner.** Run with `H` as cwd once `httpx`/`pytest` exist.
 
 | Purpose | Command |
