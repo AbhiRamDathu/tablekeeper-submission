@@ -1,0 +1,10 @@
+app/
+tests/
+*.md
+.git
+.gitignore
+**/__pycache__/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.pytest_cache/

@@ -1,0 +1,551 @@
+"""HTTP surface for Tablekeeper Stage 1.
+
+`ThreadingHTTPServer`, not the single-threaded default: the spec requires 50 concurrent in-flight
+requests with no 5xx, and a server that handles one at a time fails that before any application
+logic is even reached. Every request opens its own SQLite connection in WAL mode, so readers do not
+queue behind the writer.
+
+Routing is a table of (method, compiled path) pairs rather than a framework. The whole surface is
+small enough that a dependency would cost more than it saves, and the image ships with no pip
+install at all, which is what makes "no outbound network at run time" trivially true.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import secrets
+import sys
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zoneinfo import ZoneInfo
+
+if __package__ in (None, ""):  # `python -m app.main` from the stage-1 directory
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    __package__ = "app"
+
+from . import auth, store  # noqa: E402
+from .intervals import format_minutes, overlaps, slot_end  # noqa: E402
+from .tz import (  # noqa: E402
+    InvalidLocalTime,
+    NonExistentLocalTime,
+    format_instant,
+    minutes_of,
+    parse_local,
+    resolve,
+)
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_POSITIVE_INT_RE = re.compile(r"^\d+$")
+_REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+class HttpError(Exception):
+    """An error with the status and `error.code` the spec assigns it."""
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+def _malformed(message: str) -> HttpError:
+    return HttpError(400, "malformed_request", message)
+
+
+def _invalid(message: str) -> HttpError:
+    return HttpError(422, "validation_failed", message)
+
+
+# ---- handlers -------------------------------------------------------------
+
+def health(request, match):
+    return 200, {"status": "ok"}
+
+
+def reset(request, match):
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("fixture must be a JSON object")
+    store.reset_database(body)
+    return 204, None
+
+
+def post_signup(request, match):
+    user_id = "u_" + secrets.token_hex(6)
+    try:
+        created = auth.signup(request.json_body(), user_id)
+    except auth.MalformedRequest as exc:
+        raise _malformed(str(exc)) from exc
+    except auth.ValidationFailure as exc:
+        raise _invalid(str(exc)) from exc
+    except auth.CredentialsTaken as exc:
+        raise HttpError(409, "email_taken", str(exc)) from exc
+    return 201, created
+
+
+def post_login(request, match):
+    try:
+        return 200, auth.authenticate(request.json_body())
+    except auth.MalformedRequest as exc:
+        raise _malformed(str(exc)) from exc
+    except auth.BadCredentials as exc:
+        raise HttpError(401, "unauthenticated", str(exc)) from exc
+
+
+def list_restaurants(request, match):
+    conn = store.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, timezone, slot_minutes, reservation_duration_minutes,"
+            " cancellation_cutoff_minutes FROM restaurants ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return 200, [_restaurant_body(conn_row, None, []) for conn_row in rows]
+
+
+def get_restaurant(request, match):
+    conn = store.connect()
+    try:
+        row = conn.execute(
+            "SELECT id, name, timezone, slot_minutes, reservation_duration_minutes,"
+            " cancellation_cutoff_minutes FROM restaurants WHERE id = ?",
+            (match.group("id"),),
+        ).fetchone()
+        if row is None:
+            raise HttpError(404, "not_found", "no such restaurant")
+        tables = conn.execute(
+            "SELECT id, label, capacity FROM tables WHERE restaurant_id = ? ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        hours = conn.execute(
+            "SELECT weekday, opens, closes FROM opening_hours WHERE restaurant_id = ?"
+            " ORDER BY weekday", (row["id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+    return 200, _restaurant_body(row, [dict(t) for t in tables], [dict(h) for h in hours])
+
+
+def _restaurant_body(row, tables, hours):
+    body = {
+        "id": row["id"],
+        "name": row["name"],
+        "timezone": row["timezone"],
+        "slot_minutes": row["slot_minutes"],
+        "reservation_duration_minutes": row["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": row["cancellation_cutoff_minutes"],
+    }
+    if tables is not None:
+        body["tables"] = tables
+    if hours is not None:
+        body["opening_hours"] = hours
+    return body
+
+
+def get_availability(request, match):
+    params = request.query
+    for required in ("restaurant_id", "date", "party_size"):
+        if required not in params:
+            raise _invalid(f"{required} is required")
+
+    if not _DATE_RE.match(params["date"]):
+        raise _invalid("date must be YYYY-MM-DD")
+    try:
+        day = dt.date.fromisoformat(params["date"])
+    except ValueError as exc:
+        raise _invalid("date is not a real calendar date") from exc
+
+    if not _POSITIVE_INT_RE.match(params["party_size"]):
+        raise _invalid("party_size must be a positive integer")
+    party_size = int(params["party_size"])
+    if party_size < 1:
+        raise _invalid("party_size must be a positive integer")
+
+    conn = store.connect()
+    try:
+        restaurant = conn.execute(
+            "SELECT * FROM restaurants WHERE id = ?", (params["restaurant_id"],)
+        ).fetchone()
+        if restaurant is None:
+            raise HttpError(404, "not_found", "no such restaurant")
+        tables = conn.execute(
+            "SELECT id, capacity FROM tables WHERE restaurant_id = ? ORDER BY id",
+            (restaurant["id"],),
+        ).fetchall()
+        hours = conn.execute(
+            "SELECT opens, closes FROM opening_hours WHERE restaurant_id = ? AND weekday = ?",
+            (restaurant["id"], WEEKDAYS[day.weekday()]),
+        ).fetchall()
+        booked = conn.execute(
+            "SELECT table_id, starts_at_utc FROM reservations WHERE restaurant_id = ?"
+            " AND status != 'cancelled'", (restaurant["id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not hours:
+        # A weekday with no opening_hours entry is closed: an empty list, not a 404.
+        return 200, {"restaurant_id": restaurant["id"], "date": params["date"],
+                     "party_size": party_size, "slots": []}
+
+    zone = ZoneInfo(restaurant["timezone"])
+    duration = restaurant["reservation_duration_minutes"]
+    step = restaurant["slot_minutes"]
+    occupancy = [(row["table_id"], dt.datetime.fromisoformat(row["starts_at_utc"])) for row in booked]
+
+    slots = []
+    for window in hours:
+        start_minutes = minutes_of(window["opens"])
+        close_minutes = minutes_of(window["closes"])
+        cursor = start_minutes
+        while cursor + duration <= close_minutes:
+            label = format_minutes(cursor)
+            naive = parse_local(f"{day.isoformat()}T{label}")
+            try:
+                starts = resolve(naive, zone)
+            except NonExistentLocalTime:
+                # The wall time is skipped by a clock change; there is no such slot to offer.
+                cursor += step
+                continue
+            ends = slot_end(starts, duration)
+
+            free = []
+            for table in tables:
+                if table["capacity"] < party_size:
+                    continue
+                taken = any(
+                    table_id == table["id"] and overlaps(starts, ends, other_start, other_end)
+                    for table_id, other_start in occupancy
+                    for other_end in [slot_end(other_start, duration)]
+                )
+                if not taken:
+                    free.append(table["id"])
+
+            # A slot with no free table still appears, carrying an empty list: the restaurant is
+            # open and the grid exists, there is simply nothing left to seat at that moment.
+            slots.append({
+                "starts_at_local": f"{day.isoformat()}T{label}",
+                "starts_at": format_instant(starts),
+                "available_table_ids": free,
+            })
+            cursor += step
+
+    return 200, {"restaurant_id": restaurant["id"], "date": params["date"],
+                 "party_size": party_size, "slots": slots}
+
+
+def list_reservations(request, match):
+    request.require_user()
+    conn = store.connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM reservations WHERE user_id = ? ORDER BY created_at, reference",
+            (request.user["id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+    return 200, [_reservation_body(row) for row in rows]
+
+
+def post_reservation(request, match):
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is None or key == "":
+        raise HttpError(400, "missing_idempotency_key", "Idempotency-Key is required")
+    if not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("request body must be a JSON object")
+    for field in ("restaurant_id", "table_id", "starts_at_local"):
+        if not isinstance(body.get(field), str):
+            raise _malformed(f"{field} must be a string")
+    if not isinstance(body.get("party_size"), int) or isinstance(body.get("party_size"), bool):
+        raise _malformed("party_size must be an integer")
+
+    request_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def get_reservation(request, match):
+    request.require_user()
+    conn = store.connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM reservations WHERE reference = ? AND user_id = ?",
+            (match.group("reference"), request.user["id"]),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HttpError(404, "not_found", "no such reservation")
+    return 200, _reservation_body(row)
+
+
+def post_reservation(request, match):
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is None or key == "":
+        raise HttpError(400, "missing_idempotency_key", "Idempotency-Key is required")
+    if not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("request body must be a JSON object")
+    for field in ("restaurant_id", "table_id", "starts_at_local"):
+        if not isinstance(body.get(field), str):
+            raise _malformed(f"{field} must be a string")
+    if not isinstance(body.get("party_size"), int) or isinstance(body.get("party_size"), bool):
+        raise _malformed("party_size must be an integer")
+
+    request_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    # The replay check, the conflict check, the insert and the idempotency record all happen in
+    # ONE transaction. That is what makes the §7 burst work: BEGIN IMMEDIATE takes the write lock
+    # up front, so concurrent identical requests serialise and all but the first see the stored
+    # response. Reading the key outside the transaction, as an earlier version did, let every
+    # request in the burst find nothing, race past the conflict check and answer 409.
+    conn = store.connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute(
+            "SELECT request_hash, response_body FROM idempotency WHERE key = ? AND user_id = ?",
+            (key, user["id"]),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_hash"] != request_hash:
+                raise HttpError(409, "idempotency_key_reuse",
+                                "this key was used with a different request body")
+            # Replay returns the original response verbatim, and 200 rather than the original 201:
+            # the operation is not being performed a second time.
+            replay = json.loads(stored["response_body"])
+            conn.execute("COMMIT")
+            return 200, replay
+
+        created = _create_reservation(conn, body, user["id"])
+        conn.execute(
+            "INSERT INTO idempotency (key, user_id, request_hash, status_code, response_body)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (key, user["id"], request_hash, created[0], json.dumps(created[1])),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the rollback failure is not the interesting error
+            pass
+        raise
+    finally:
+        conn.close()
+    return created
+
+
+def _create_reservation(conn, body, user_id):
+    """Insert the reservation on an already-open transaction. Does not commit.
+
+    The conflict check lives inside the caller's transaction on purpose: §11 requires that the
+    decision to book and the booking itself cannot be separated by a concurrent writer.
+    """
+    restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                              (body["restaurant_id"],)).fetchone()
+    if restaurant is None:
+        raise HttpError(404, "not_found", "no such restaurant")
+    table = conn.execute(
+        "SELECT * FROM tables WHERE id = ? AND restaurant_id = ?",
+        (body["table_id"], body["restaurant_id"]),
+    ).fetchone()
+    if table is None:
+        raise _invalid("no such table at this restaurant")
+    party_size = body["party_size"]
+    if party_size < 1:
+        raise _invalid("party_size must be at least 1")
+    if table["capacity"] < party_size:
+        raise _invalid("table is too small for this party")
+
+    try:
+        naive = parse_local(body["starts_at_local"])
+    except InvalidLocalTime as exc:
+        raise _invalid(str(exc)) from exc
+    zone = ZoneInfo(restaurant["timezone"])
+    try:
+        starts = resolve(naive, zone)
+    except NonExistentLocalTime as exc:
+        raise _invalid(str(exc)) from exc
+    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+
+    others = conn.execute(
+        "SELECT starts_at_utc FROM reservations WHERE table_id = ? AND status != 'cancelled'",
+        (table["id"],),
+    ).fetchall()
+    for row in others:
+        other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
+        if overlaps(starts, ends, other_start,
+                    slot_end(other_start, restaurant["reservation_duration_minutes"])):
+            raise HttpError(409, "table_unavailable", "that table is already booked")
+
+    reference = _new_reference()
+    created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO reservations (reference, restaurant_id, table_id, user_id,"
+        " starts_at_utc, starts_at_local, party_size, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)",
+        (reference, restaurant["id"], table["id"], user_id,
+         starts.astimezone(dt.timezone.utc).isoformat(),
+         body["starts_at_local"], party_size, created_at),
+    )
+    stored = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                          (reference,)).fetchone()
+    return 201, _reservation_body(stored)
+
+
+def _new_reference() -> str:
+    return "".join(secrets.choice(_REFERENCE_ALPHABET) for _ in range(6))
+
+
+def _reservation_body(row):
+    return {
+        "reference": row["reference"],
+        "reservation_id": row["reference"],
+        "restaurant_id": row["restaurant_id"],
+        "table_id": row["table_id"],
+        "user_id": row["user_id"],
+        "starts_at_local": row["starts_at_local"],
+        "starts_at": format_instant(dt.datetime.fromisoformat(row["starts_at_utc"])),
+        "party_size": row["party_size"],
+        "status": row["status"],
+    }
+
+
+ROUTES = [
+    ("GET", re.compile(r"^/health$"), health),
+    ("POST", re.compile(r"^/_test/reset$"), reset),
+    ("POST", re.compile(r"^/auth/signup$"), post_signup),
+    ("POST", re.compile(r"^/auth/login$"), post_login),
+    ("GET", re.compile(r"^/restaurants$"), list_restaurants),
+    ("GET", re.compile(r"^/restaurants/(?P<id>[^/]+)$"), get_restaurant),
+    ("GET", re.compile(r"^/availability$"), get_availability),
+    ("POST", re.compile(r"^/reservations$"), post_reservation),
+    ("GET", re.compile(r"^/reservations$"), list_reservations),
+    ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), get_reservation),
+]
+
+
+class Request:
+    """One parsed HTTP request."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.headers = handler.headers
+        self.query = {k: v[-1] for k, v in
+                      urllib.parse.parse_qs(handler.path.partition("?")[2]).items()}
+        self.user = None
+
+    def raw_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.handler.rfile.read(length) if length else b""
+
+    def json_body(self):
+        raw = self.raw_body()
+        if not raw:
+            raise _malformed("a JSON object is required")
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise _malformed("body is not valid JSON") from exc
+
+    def bearer_token(self):
+        header = self.headers.get("Authorization") or ""
+        prefix, _, value = header.partition(" ")
+        if prefix.lower() != "bearer" or not value.strip():
+            return None
+        return value.strip()
+
+    def require_user(self):
+        """The authenticated user, or 401.
+
+        A missing header and an unknown token both land here and are answered identically, so a
+        caller cannot use the response to learn whether a token exists.
+        """
+        if self.user is None:
+            self.user = auth.user_for_token(self.bearer_token())
+        if self.user is None:
+            raise HttpError(401, "unauthenticated", "a valid bearer token is required")
+        return self.user
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "tablekeeper/1.0"
+
+    def _dispatch(self, method: str) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        try:
+            for candidate_method, pattern, handler in ROUTES:
+                if candidate_method != method:
+                    continue
+                match = pattern.match(path)
+                if match is None:
+                    continue
+                request = Request(self)
+                status, body = handler(request, match)
+                self._respond(status, body)
+                return
+            self._respond(404, {"error": {"code": "not_found",
+                                          "message": f"no route for {method} {path}"}})
+        except HttpError as exc:
+            self._respond(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except Exception as exc:  # noqa: BLE001 - a bug must be a 500, not a hung connection
+            self._respond(500, {"error": {"code": "internal_error", "message": str(exc)}})
+
+    def _respond(self, status: int, body) -> None:
+        if status == 204 or body is None:
+            payload = b""
+        else:
+            payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        if payload:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:
+        self._dispatch("POST")
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def serve(port: int | None = None) -> None:
+    """Run until interrupted. Binds 0.0.0.0 so a published port reaches it."""
+    if port is None:
+        port = int(os.environ.get("PORT", "8080"))
+    store.ensure_schema()
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
+    print(f"tablekeeper stage-1 listening on 0.0.0.0:{port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    serve()
