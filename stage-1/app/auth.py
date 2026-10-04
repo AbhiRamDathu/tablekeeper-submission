@@ -99,7 +99,10 @@ def signup(body: object, user_id: str) -> dict:
         if "email" in str(exc).lower() or "unique" in str(exc).lower():
             raise CredentialsTaken(email) from exc
         raise
-    return {"user_id": user_id, "email": email, "token": token}
+    # §6 answers 201 with {user_id, display_name, token}. The name is echoed from the value
+    # `validate_signup` already checked rather than re-derived, so the response cannot disagree with
+    # the column that was just written.
+    return {"user_id": user_id, "email": email, "display_name": display_name, "token": token}
 
 
 def authenticate(body: object) -> dict:
@@ -113,7 +116,7 @@ def authenticate(body: object) -> dict:
 
     conn = store.connect()
     try:
-        row = conn.execute("SELECT id, password_hash FROM users WHERE email = ?",
+        row = conn.execute("SELECT id, password_hash, display_name FROM users WHERE email = ?",
                            (email,)).fetchone()
     finally:
         conn.close()
@@ -127,7 +130,10 @@ def authenticate(body: object) -> dict:
         conn.execute("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, row["id"]))
     finally:
         conn.close()
-    return {"user_id": row["id"], "email": email, "token": token}
+    # §6 answers 200 with the same three fields as signup. Login carries no display_name of its own,
+    # so the name has to come off the stored row -- the same column `user_for_token` already selects.
+    return {"user_id": row["id"], "email": email, "display_name": row["display_name"],
+            "token": token}
 
 
 def issue_token() -> str:
