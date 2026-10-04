@@ -53,6 +53,29 @@ log = logging.getLogger(__name__)
 # join the two.
 GENERIC_500_MESSAGE = "an internal error occurred"
 
+# `BaseHTTPRequestHandler.send_error` speaks its own dialect: an HTML page. The spec says every 4xx
+# and 5xx body is `{"error":{"code":...,"message":...}}`, and the errors it raises are exactly the
+# ones a client can provoke at will -- an unimplemented verb, a malformed request line, a URI past
+# the line limit. Left alone, the only errors a caller can trigger deliberately are the only ones
+# they cannot parse. Codes the framework can actually raise are 400/414/431/501/505; 401/403/404 are
+# here because `send_error` is public and an application path should not silently lose the spec's
+# vocabulary by calling it.
+_FRAMEWORK_ERROR_CODES = {
+    400: "malformed_request",
+    401: "unauthenticated",
+    403: "forbidden",
+    404: "not_found",
+    414: "uri_too_long",
+    431: "too_many_headers",
+    501: "not_implemented",
+    505: "http_version_not_supported",
+}
+
+
+def _framework_error_code(status: int) -> str:
+    """The `error.code` for a framework-raised status, in the spec's vocabulary where it has one."""
+    return _FRAMEWORK_ERROR_CODES.get(status, "request_failed")
+
 
 def _new_correlation_id() -> str:
     """An opaque id for one 500, echoed to the client and written to the log beside the cause."""
@@ -540,6 +563,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if payload:
             self.wfile.write(payload)
+
+    def send_error(self, code, message=None, explain=None) -> None:
+        """Answer the framework's own errors in the same envelope the application uses.
+
+        Called by `BaseHTTPRequestHandler` for an unsupported verb, an unparseable request line, a
+        request line past the length limit, too many headers, or an unsupported HTTP version. The
+        base implementation emits an HTML page, which the spec forbids for every 4xx and 5xx.
+
+        The structure mirrors the base method exactly -- `Connection: close`, the same no-body
+        statuses, the same `HEAD` suppression -- so the only thing that changes is the body. Two
+        deliberate choices: the wire gets `shortmsg`, the static reason phrase, so a client's own
+        bytes are never reflected back at it; and `Connection: close` is preserved because on the
+        unsupported-verb path the request body has not been read, so the stream cannot be reused.
+        The full `message` still goes to `log_error` for the operator.
+        """
+        code = int(code)
+        try:
+            shortmsg, longmsg = self.responses[code]
+        except KeyError:
+            shortmsg, longmsg = "???", "???"
+        if message is None:
+            message = shortmsg
+        if explain is None:
+            explain = longmsg
+        self.log_error("code %d, message %s", code, message)
+
+        self.send_response(code, message)
+        self.send_header("Connection", "close")
+
+        # Same exclusions as the base method: RFC 7230 1xx/204/304 and RFC 7231 205 carry no body.
+        body = None
+        if code >= 200 and code not in (204, 205, 304):
+            body = json.dumps({"error": {"code": _framework_error_code(code),
+                                         "message": shortmsg}}).encode("utf-8")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
 
     def do_GET(self) -> None:
         self._dispatch("GET")
