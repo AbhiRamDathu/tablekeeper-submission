@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -41,6 +42,21 @@ WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _POSITIVE_INT_RE = re.compile(r"^\d+$")
 _REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+log = logging.getLogger(__name__)
+
+# The only text a client ever sees for an unhandled exception, and it interpolates nothing. A
+# `sqlite3` message names tables and columns ("UNIQUE constraint failed: tables.id"), so sending
+# `str(exc)` to the wire publishes the schema to whoever happened to trigger the bug -- and the
+# catch-all is reachable with no token at all, since an unauthenticated `POST /_test/reset` is
+# enough. The detail goes to the server log instead; the correlation id is what lets an operator
+# join the two.
+GENERIC_500_MESSAGE = "an internal error occurred"
+
+
+def _new_correlation_id() -> str:
+    """An opaque id for one 500, echoed to the client and written to the log beside the cause."""
+    return secrets.token_hex(8)
 
 
 class HttpError(Exception):
@@ -506,7 +522,11 @@ class Handler(BaseHTTPRequestHandler):
         except HttpError as exc:
             self._respond(exc.status, {"error": {"code": exc.code, "message": exc.message}})
         except Exception as exc:  # noqa: BLE001 - a bug must be a 500, not a hung connection
-            self._respond(500, {"error": {"code": "internal_error", "message": str(exc)}})
+            correlation = _new_correlation_id()
+            log.exception("unhandled exception (correlation %s)", correlation)
+            self._respond(500, {"error": {"code": "internal_error",
+                                          "message": GENERIC_500_MESSAGE,
+                                          "correlation_id": correlation}})
 
     def _respond(self, status: int, body) -> None:
         if status == 204 or body is None:
