@@ -390,6 +390,52 @@ def post_reservation(request, match):
     return created
 
 
+def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
+                     exclude_reference=None):
+    """Validate a booking exactly as create does and return `(table, starts)`.
+
+    Shared with `PATCH /reservations/{reference}`, which the spec requires to apply "same
+    validation as create" -- so it calls this rather than keeping a second copy that has to be
+    kept in agreement. `exclude_reference` drops the reservation being amended from the conflict
+    check, which would otherwise collide with itself for every PATCH.
+    """
+    table = conn.execute(
+        "SELECT * FROM tables WHERE id = ? AND restaurant_id = ?",
+        (table_id, restaurant["id"]),
+    ).fetchone()
+    if table is None:
+        raise _invalid("no such table at this restaurant")
+    if party_size < 1:
+        raise _invalid("party_size must be at least 1")
+    if table["capacity"] < party_size:
+        raise _invalid("table is too small for this party")
+
+    try:
+        naive = parse_local(starts_at_local)
+    except InvalidLocalTime as exc:
+        raise _invalid(str(exc)) from exc
+    zone = ZoneInfo(restaurant["timezone"])
+    try:
+        starts = resolve(naive, zone)
+    except NonExistentLocalTime as exc:
+        raise _invalid(str(exc)) from exc
+    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+
+    clash = ("SELECT starts_at_utc FROM reservations"
+             " WHERE table_id = ? AND status != 'cancelled'")
+    params = [table["id"]]
+    if exclude_reference is not None:
+        clash += " AND reference != ?"
+        params.append(exclude_reference)
+    for row in conn.execute(clash, params).fetchall():
+        other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
+        if overlaps(starts, ends, other_start,
+                    slot_end(other_start, restaurant["reservation_duration_minutes"])):
+            raise HttpError(409, "table_unavailable", "that table is already booked")
+
+    return table, starts
+
+
 def _create_reservation(conn, body, user_id):
     """Insert the reservation on an already-open transaction. Does not commit.
 
@@ -400,38 +446,9 @@ def _create_reservation(conn, body, user_id):
                               (body["restaurant_id"],)).fetchone()
     if restaurant is None:
         raise HttpError(404, "not_found", "no such restaurant")
-    table = conn.execute(
-        "SELECT * FROM tables WHERE id = ? AND restaurant_id = ?",
-        (body["table_id"], body["restaurant_id"]),
-    ).fetchone()
-    if table is None:
-        raise _invalid("no such table at this restaurant")
     party_size = body["party_size"]
-    if party_size < 1:
-        raise _invalid("party_size must be at least 1")
-    if table["capacity"] < party_size:
-        raise _invalid("table is too small for this party")
-
-    try:
-        naive = parse_local(body["starts_at_local"])
-    except InvalidLocalTime as exc:
-        raise _invalid(str(exc)) from exc
-    zone = ZoneInfo(restaurant["timezone"])
-    try:
-        starts = resolve(naive, zone)
-    except NonExistentLocalTime as exc:
-        raise _invalid(str(exc)) from exc
-    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
-
-    others = conn.execute(
-        "SELECT starts_at_utc FROM reservations WHERE table_id = ? AND status != 'cancelled'",
-        (table["id"],),
-    ).fetchall()
-    for row in others:
-        other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
-        if overlaps(starts, ends, other_start,
-                    slot_end(other_start, restaurant["reservation_duration_minutes"])):
-            raise HttpError(409, "table_unavailable", "that table is already booked")
+    table, starts = _resolve_booking(conn, restaurant, body["table_id"],
+                                      body["starts_at_local"], party_size)
 
     reference = _new_reference()
     created_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -450,6 +467,87 @@ def _create_reservation(conn, body, user_id):
 
 def _new_reference() -> str:
     return "".join(secrets.choice(_REFERENCE_ALPHABET) for _ in range(6))
+
+
+def patch_reservation(request, match):
+    """Amend a reservation in place. `any subset` of the three mutable fields, no key required.
+
+    §7 makes the idempotency key mandatory on create and moves only, so one sent here is neither
+    required nor recorded -- and per §7 a key already used on another path is not a replay, so a
+    PATCH carrying a create's key must still succeed normally. Validating rather than ignoring a
+    present key is the one thing done about it: §5 states the 1..255 length rule without scoping
+    it to the endpoints that demand the header.
+    """
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is not None and not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("request body must be a JSON object")
+    for field in ("table_id", "starts_at_local"):
+        if field in body and not isinstance(body[field], str):
+            raise _malformed(f"{field} must be a string")
+    if "party_size" in body and (not isinstance(body["party_size"], int)
+                                 or isinstance(body["party_size"], bool)):
+        raise _malformed("party_size must be an integer")
+
+    reference = match.group("reference")
+    conn = store.connect()
+    try:
+        # One transaction for the read, the checks and the write: §8 requires a failed amendment to
+        # leave the original booking AND its occupancy untouched, which is only true if the failure
+        # and the rewrite share a boundary.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                           (reference,)).fetchone()
+        # Not the caller's is 404, not 403: §5 folds "not visible to this caller" into not_found,
+        # so a 403 here would confirm the reference exists.
+        if row is None or row["user_id"] != user["id"]:
+            raise HttpError(404, "not_found", "no such reservation")
+        if row["status"] == "cancelled":
+            raise HttpError(409, "reservation_cancelled", "this reservation is cancelled")
+
+        restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                  (row["restaurant_id"],)).fetchone()
+
+        # The cutoff is measured against the CURRENT start, as the spec insists. Re-anchoring it to
+        # the requested start would let a caller inside the window walk the booking forward to a
+        # later slot and keep amending it, which is the thing the cutoff exists to prevent.
+        cutoff_at = (dt.datetime.fromisoformat(row["starts_at_utc"])
+                     - dt.timedelta(minutes=restaurant["cancellation_cutoff_minutes"]))
+        if dt.datetime.now(dt.timezone.utc) >= cutoff_at:
+            raise HttpError(409, "cutoff_passed", "too close to the start to amend")
+
+        # Absent fields keep their stored value, which is what makes the subset literal.
+        table_id = body.get("table_id", row["table_id"])
+        starts_at_local = body.get("starts_at_local", row["starts_at_local"])
+        party_size = body.get("party_size", row["party_size"])
+
+        _table, starts = _resolve_booking(conn, restaurant, table_id, starts_at_local,
+                                          party_size, exclude_reference=reference)
+
+        # `reference` and `status` are deliberately absent from the SET list: the spec requires both
+        # to survive an amendment.
+        conn.execute(
+            "UPDATE reservations SET table_id = ?, starts_at_local = ?, starts_at_utc = ?,"
+            " party_size = ? WHERE reference = ?",
+            (table_id, starts_at_local, starts.astimezone(dt.timezone.utc).isoformat(),
+             party_size, reference),
+        )
+        updated = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                               (reference,)).fetchone()
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the rollback failure is not the interesting error
+            pass
+        raise
+    finally:
+        conn.close()
+    return 200, _reservation_body(updated)
 
 
 def _reservation_body(row):
@@ -477,6 +575,7 @@ ROUTES = [
     ("POST", re.compile(r"^/reservations$"), post_reservation),
     ("GET", re.compile(r"^/reservations$"), list_reservations),
     ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), get_reservation),
+    ("PATCH", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), patch_reservation),
 ]
 
 
@@ -609,6 +708,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._dispatch("POST")
+
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
 
     def log_message(self, *args) -> None:
         pass
