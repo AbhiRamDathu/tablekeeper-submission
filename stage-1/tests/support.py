@@ -215,3 +215,107 @@ def book(node, client=None, *, table_id="t_2", at="19:00", party_size=4, key=Non
         "/reservations", json_body=body,
         headers={"Idempotency-Key": key or f"k-{at}-{table_id}-{id(body)}"},
     )
+
+
+# ---- fixtures the spec gate (tests/test_spec_stage1.py) needs ---------------------------
+#
+# Everything above this line is the scaffolding the shipped suite already uses. The helpers below
+# exist because the shipped fixtures cannot express the states the spec requires: two restaurants
+# whose table ids collide, a reservation seeded in the shape §4 actually prescribes, and opening
+# hours that span a clock change.
+
+
+def opening_hours_on(date_str: str, opens: str, closes: str) -> list[dict]:
+    """One `opening_hours` entry, on the weekday of `date_str`.
+
+    A transition-date test needs hours that actually span the clock change, and the weekday has to
+    match the date the test pins itself to. The default all-week fixture can do neither.
+    """
+    return [{"weekday": weekday_of(date_str), "opens": opens, "closes": closes}]
+
+
+def tables(prefix: str = "t", capacities=(2, 4, 6)) -> list[dict]:
+    """Three tables whose ids are namespaced by `prefix`."""
+    return [{"id": f"{prefix}_{index}", "label": str(index), "capacity": capacity}
+            for index, capacity in enumerate(capacities, start=1)]
+
+
+def two_restaurants(shared_table_ids: bool = True) -> list[dict]:
+    """Two restaurants, with or without colliding table ids.
+
+    §4 constrains a table id by nothing at all, so two restaurants both owning `t_1..t_3` is a
+    legal fixture. Naming them apart is the only way to test anything that spans two restaurants.
+    """
+    if shared_table_ids:
+        return [restaurant("r_one"), restaurant("r_two", name="Second")]
+    return [restaurant("r_one", tables=tables("t")),
+            restaurant("r_two", name="Second", tables=tables("u"))]
+
+
+def spec_seeded_reservation(reference="AAAAAA", *, restaurant_id="r_anker", table_id="t_2",
+                            user_id=ADA["id"], starts_at_local="2026-06-01T19:00",
+                            party_size=4) -> dict:
+    """A seeded reservation in the shape §4 prescribes.
+
+    "Same fields as a create body plus `id`, `reference`, `user_id`". Note what is absent: there
+    is no `starts_at_utc`, because §4 never mentions one and a fixture author following the spec
+    cannot know to invent it.
+    """
+    return {
+        "id": f"res_{reference}",
+        "reference": reference,
+        "user_id": user_id,
+        "restaurant_id": restaurant_id,
+        "table_id": table_id,
+        "starts_at_local": starts_at_local,
+        "party_size": party_size,
+    }
+
+
+def seeded_reservation(reference="AAAAAA", *, restaurant_id="r_anker", table_id="t_1",
+                       user_id=ADA["id"], starts_at_local="2026-06-01T18:00",
+                       starts_at_utc="2026-06-01T16:00:00+00:00", party_size=2,
+                       created_at="2026-05-01T00:00:00+00:00") -> dict:
+    """A seeded reservation carrying `starts_at_utc`, so a test can pin absolute times.
+
+    This is the shape the current `store.reset_database` happens to accept. It is *not* the shape
+    §4 prescribes — `spec_seeded_reservation` is — and a test that needs controlled instants uses
+    this one only to isolate something other than the fixture contract itself.
+    """
+    return {
+        "reference": reference,
+        "restaurant_id": restaurant_id,
+        "table_id": table_id,
+        "user_id": user_id,
+        "starts_at_utc": starts_at_utc,
+        "starts_at_local": starts_at_local,
+        "party_size": party_size,
+        "status": "confirmed",
+        "created_at": created_at,
+    }
+
+
+# Tests the shipped suite already owns. The spec gate references these and does not clone them: a
+# second copy of either assertion would duplicate coverage while inflating the gate's own count,
+# which is the counting-instead-of-naming failure the gate exists to avoid.
+REFERENCED_SHIPPED_TESTS = {
+    "test_concurrent_identical_requests_book_exactly_once":
+        "the §7 burst tally: exactly one 201, the rest 200, one booking in the database",
+    "test_fifty_concurrent_requests_produce_no_5xx":
+        "the §2 load bound: 50 concurrent in flight, no 5xx",
+}
+
+
+def assert_all(testcase, legs) -> None:
+    """Compare `want` against `got` for every leg at once, and fail once if any disagree.
+
+    A single named defect usually has more than one observable symptom — a wrong status and a
+    missing field, or three broken arithmetic cases across two zones. Raising on the first one
+    hides the rest, and a gate that reports one symptom per run is short of the evidence.
+    """
+    disagreeing = [(what, want, got) for what, want, got in legs if want != got]
+    testcase.assertEqual(
+        disagreeing, [],
+        "\n".join(
+            [f"{len(disagreeing)} of {len(legs)} checks disagree with the spec:"]
+            + [f"  {what}: expected {want!r}, got {got!r}" for what, want, got in disagreeing]))
