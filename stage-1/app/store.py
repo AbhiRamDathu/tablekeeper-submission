@@ -24,6 +24,21 @@ from typing import Iterator
 
 __all__ = ["database_path", "connect", "transaction", "SCHEMA"]
 
+# Kept apart from the rest of the schema because the migration below has to reissue exactly this
+# statement. A second hand-written copy of the DDL would be free to drift from the table every fresh
+# database gets, and the drift would only show up in an upgraded one.
+IDEMPOTENCY_DDL = """
+CREATE TABLE IF NOT EXISTS idempotency (
+    key           TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    status_code   INTEGER NOT NULL,
+    response_body TEXT NOT NULL,
+    PRIMARY KEY (key, user_id, scope)
+);
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
@@ -68,15 +83,7 @@ CREATE TABLE IF NOT EXISTS reservations (
 );
 CREATE INDEX IF NOT EXISTS reservations_by_table
     ON reservations(table_id, starts_at_utc);
-CREATE TABLE IF NOT EXISTS idempotency (
-    key           TEXT NOT NULL,
-    user_id       TEXT NOT NULL,
-    request_hash  TEXT NOT NULL,
-    status_code   INTEGER NOT NULL,
-    response_body TEXT NOT NULL,
-    PRIMARY KEY (key, user_id)
-);
-"""
+""" + IDEMPOTENCY_DDL
 
 
 def database_path() -> pathlib.Path:
@@ -182,5 +189,62 @@ def ensure_schema() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _widen_idempotency_for_path_scoping(conn)
     finally:
         conn.close()
+
+
+#: The scope every receipt written before §7:79 must carry after the upgrade. `POST /reservations`
+#: was the only idempotency-required path in the service when such a receipt was written --
+#: `POST /reservation-moves` did not exist -- and `Request.idempotency_scope` builds
+#: `"{METHOD} {path}"` from a path with its query string already stripped, so `/reservations` is the
+#: only path a pre-moves create could have recorded. Anything else would answer 409
+#: `idempotency_key_reuse` to a legitimate retry, or silently treat it as a first use.
+_PRE_SCOPE_RESERVATIONS_SCOPE = "POST /reservations"
+
+
+def _widen_idempotency_for_path_scoping(conn: sqlite3.Connection) -> None:
+    """Carry `idempotency` across from the pre-§7:79 shape, without losing a receipt.
+
+    `CREATE TABLE IF NOT EXISTS` cannot widen an existing table, so a database written before moves
+    existed still carries the old `(key, user_id)` primary key and no `scope` column, and every
+    insert against the new schema would fail for want of the column. Widening a primary key is the
+    one thing SQLite cannot do with `ALTER TABLE`, so the table is rebuilt -- renamed aside, the
+    current DDL reissued, the rows copied across, and only then the old table dropped.
+
+    The order is the point: **copy, then drop.** The receipts are copied before anything is
+    destroyed, so no failure between the two can lose one. And all four statements sit in one
+    `BEGIN IMMEDIATE`, so a process killed mid-migration rolls back to the old table intact and the
+    next start simply tries again -- there is no window in which `idempotency` does not exist.
+
+    Receipts are not derived state in the way the previous version of this function claimed. No
+    domain row references them, true, but §7 makes a client depend on one directly: :86/:92 owe it
+    the original response, and a key with no receipt is a first use, which for a create is a second
+    booking. That is why nothing here drops a row.
+    """
+    info = list(conn.execute("PRAGMA table_info(idempotency)"))
+    if not info:
+        return
+    columns = {row["name"] for row in info}
+    # `pk` is the 1-based position in the primary key, 0 for a plain column.
+    primary_key = [row["name"] for row in sorted(info, key=lambda row: row["pk"]) if row["pk"]]
+    if "scope" in columns and primary_key == ["key", "user_id", "scope"]:
+        return
+
+    # A table that already has `scope` keeps whatever it says; one that does not is backfilled,
+    # because a receipt whose scope cannot be recovered is a receipt that will never replay.
+    scope_source = "scope" if "scope" in columns else "?"
+    params = () if "scope" in columns else (_PRE_SCOPE_RESERVATIONS_SCOPE,)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("ALTER TABLE idempotency RENAME TO idempotency__pre_scope")
+        conn.execute(IDEMPOTENCY_DDL)
+        conn.execute(
+            "INSERT INTO idempotency (key, user_id, scope, request_hash, status_code,"
+            " response_body) SELECT key, user_id, " + scope_source + ", request_hash, status_code,"
+            " response_body FROM idempotency__pre_scope", params)
+        conn.execute("DROP TABLE idempotency__pre_scope")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise

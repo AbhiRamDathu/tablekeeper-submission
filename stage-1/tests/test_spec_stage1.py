@@ -39,7 +39,9 @@ from tests.support import (
     REFERENCED_SHIPPED_TESTS,
     Client,
     assert_all,
+    booking_date,
     fixture,
+    local,
     opening_hours_on,
     restaurant,
     seeded_reservation,
@@ -389,25 +391,34 @@ class SpecGate(unittest.TestCase):
             assert_all(self, legs)
 
     def test_idempotency_key_scoped_by_path(self):
-        """§7: replay needs same user, same method, same *path*, same body.
+        """§7: a replay needs same user, same method, same *path*, same body.
 
-        The same key and body on a different path is a first use and must succeed normally. The
-        stored key is `(key, user_id)` with no path column, so this is the assertion that will
-        catch the scoping when the second idempotency-required path exists.
+        §7:80 -- the same key and body on a *different* path is a first use and must succeed
+        normally. The receipt table's primary key was `(key, user_id)` with no path, so a key spent
+        on a create made the same body on the batch endpoint look like a replay of the other route.
+
+        The probe has to be a request that can actually commit, and this is the second revision of
+        it. `{"moves": []}` cannot: §11:186 bounds a batch at 1-8 objects, so an empty array is
+        422 `validation_failed` before any resource is read. That answer is identical with and
+        without the `scope` column, so the probe was reporting red for a reason that had nothing to
+        do with the defect it names -- the failure mode this module's own docstring calls a cause
+        the runner never checked. The batch therefore moves the booking the first leg created.
+
+        Which means the booking cannot sit on a hard-coded past date: §11:196 applies each
+        booking's existing cancellation cutoff to every move, and a start already inside that
+        window answers 409 `cutoff_passed` before the scope lookup is ever reached.
         """
         body = {"restaurant_id": "r_one", "table_id": "t_2",
-                "starts_at_local": "2026-06-01T19:00", "party_size": 4}
+                "starts_at_local": local(booking_date()), "party_size": 4}
         with reset_with(two_restaurants(shared_table_ids=False)) as client:
             first = client.post("/reservations", json_body=body,
                                 headers={"Idempotency-Key": "cross-path"})
-            same_key_other_path = client.post("/reservation-moves",
-                                              json_body={"moves": []},
-                                              headers={"Idempotency-Key": "cross-path"})
+            same_key_other_path = client.post(
+                "/reservation-moves",
+                json_body={"moves": [{"reference": first.json["reference"]}]},
+                headers={"Idempotency-Key": "cross-path"})
             legs = [
                 ("first use on POST /reservations", 201, first.status),
-                # Reported separately from the assertion below so the failure output says which
-                # of the two is actually true: today the route is absent, so path scoping cannot
-                # be observed at all and the red is honest about not knowing the cause.
                 ("POST /reservation-moves exists (§7's second idempotency-required path)",
                  True, same_key_other_path.status != 404),
                 ("same key + body on a different path is a first use, not a 200 replay",

@@ -43,6 +43,10 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _POSITIVE_INT_RE = re.compile(r"^\d+$")
 _REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
+#: §11:186 bounds a batch at 1-8 move objects. Zero is out of range too, which is why an empty
+#: `moves` array is a validation error rather than a successful no-op.
+_MAX_MOVES = 8
+
 log = logging.getLogger(__name__)
 
 # The only text a client ever sees for an unhandled exception, and it interpolates nothing. A
@@ -349,6 +353,7 @@ def post_reservation(request, match):
     request_hash = hashlib.sha256(
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    scope = request.idempotency_scope()
 
     # The replay check, the conflict check, the insert and the idempotency record all happen in
     # ONE transaction. That is what makes the §7 burst work: BEGIN IMMEDIATE takes the write lock
@@ -359,8 +364,9 @@ def post_reservation(request, match):
     try:
         conn.execute("BEGIN IMMEDIATE")
         stored = conn.execute(
-            "SELECT request_hash, response_body FROM idempotency WHERE key = ? AND user_id = ?",
-            (key, user["id"]),
+            "SELECT request_hash, response_body FROM idempotency"
+            " WHERE key = ? AND user_id = ? AND scope = ?",
+            (key, user["id"], scope),
         ).fetchone()
         if stored is not None:
             if stored["request_hash"] != request_hash:
@@ -374,9 +380,9 @@ def post_reservation(request, match):
 
         created = _create_reservation(conn, body, user["id"])
         conn.execute(
-            "INSERT INTO idempotency (key, user_id, request_hash, status_code, response_body)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (key, user["id"], request_hash, created[0], json.dumps(created[1])),
+            "INSERT INTO idempotency (key, user_id, scope, request_hash, status_code,"
+            " response_body) VALUES (?, ?, ?, ?, ?, ?)",
+            (key, user["id"], scope, request_hash, created[0], json.dumps(created[1])),
         )
         conn.execute("COMMIT")
     except BaseException:
@@ -405,14 +411,11 @@ def _enforce_cutoff(row, restaurant, what):
         raise HttpError(409, "cutoff_passed", f"too close to the start to {what}")
 
 
-def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
-                     exclude_reference=None):
-    """Validate a booking exactly as create does and return `(table, starts)`.
+def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_size):
+    """Every check on a requested booking except occupancy. Returns `(table, starts)`.
 
-    Shared with `PATCH /reservations/{reference}`, which the spec requires to apply "same
-    validation as create" -- so it calls this rather than keeping a second copy that has to be
-    kept in agreement. `exclude_reference` drops the reservation being amended from the conflict
-    check, which would otherwise collide with itself for every PATCH.
+    Split out from `_assert_slot_free` because §11:197 requires a batch's *non-occupancy* errors to
+    be settled before any occupancy error, which a single combined pass cannot express.
     """
     table = conn.execute(
         "SELECT * FROM tables WHERE id = ? AND restaurant_id = ?",
@@ -434,8 +437,16 @@ def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
         starts = resolve(naive, zone)
     except NonExistentLocalTime as exc:
         raise _invalid(str(exc)) from exc
-    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+    return table, starts
 
+
+def _assert_slot_free(conn, restaurant, table, starts, exclude_reference=None):
+    """409 `table_unavailable` if the requested interval collides with a live booking.
+
+    `exclude_reference` drops the reservation being amended from the check, which would otherwise
+    collide with itself.
+    """
+    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
     clash = ("SELECT starts_at_utc FROM reservations"
              " WHERE table_id = ? AND status != 'cancelled'")
     params = [table["id"]]
@@ -448,6 +459,18 @@ def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
                     slot_end(other_start, restaurant["reservation_duration_minutes"])):
             raise HttpError(409, "table_unavailable", "that table is already booked")
 
+
+def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
+                     exclude_reference=None):
+    """Validate a booking exactly as create does and return `(table, starts)`.
+
+    Shared with `PATCH /reservations/{reference}`, which the spec requires to apply "same
+    validation as create" -- so it calls this rather than keeping a second copy that has to be
+    kept in agreement.
+    """
+    table, starts = _validate_booking_fields(conn, restaurant, table_id,
+                                             starts_at_local, party_size)
+    _assert_slot_free(conn, restaurant, table, starts, exclude_reference)
     return table, starts
 
 
@@ -618,6 +641,167 @@ def cancel_reservation(request, match):
     return 200, _reservation_body(updated)
 
 
+def post_reservation_moves(request, match):
+    """`POST /reservation-moves` -- §11, the batch amendment endpoint.
+
+    Two passes inside a single transaction, and the ordering between them is the point of :197:
+
+    1. every item's non-occupancy checks, walked in input order -- 404, cancelled, cutoff, the
+       shared restaurant, then the ordinary amendment field rules;
+    2. then occupancy, also in input order, applying each item as it clears so the next item is
+       checked against its predecessor's *destination*. That is what makes :199's "overlap among
+       resulting bookings" fall out without a second copy of the conflict logic.
+
+    Nothing here commits until every item is through both passes, so no caller can observe a
+    half-applied batch and a failure leaves reservations and occupancy untouched, as :201 requires.
+    """
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is None or key == "":
+        raise HttpError(400, "missing_idempotency_key", "Idempotency-Key is required")
+    if not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("request body must be a JSON object")
+
+    # §7:81-83 resolves the key after the body parses as an object and after authentication, but
+    # *before* endpoint-specific field validation and current-resource checks. So the receipt is
+    # looked up before the shape of `moves` is judged at all -- which is why a replay of a batch
+    # that has since become invalid still answers 200, and why a spent key with a different body
+    # answers 409 even when that body is nonsense.
+    request_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    scope = request.idempotency_scope()
+
+    conn = store.connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute(
+            "SELECT request_hash, response_body FROM idempotency"
+            " WHERE key = ? AND user_id = ? AND scope = ?",
+            (key, user["id"], scope),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_hash"] != request_hash:
+                raise HttpError(409, "idempotency_key_reuse",
+                                "this key was used with a different request body")
+            replay = json.loads(stored["response_body"])
+            conn.execute("COMMIT")
+            return 200, replay
+
+        moves = _validated_moves(body)
+
+        # Pass one: non-occupancy only, in input order.
+        restaurant = None
+        planned = []
+        for item in moves:
+            reference = item["reference"]
+            row = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                               (reference,)).fetchone()
+            # Not the caller's is 404, not 403: §5 folds "not visible to this caller" into
+            # not_found, so a 403 would confirm the reference exists.
+            if row is None or row["user_id"] != user["id"]:
+                raise HttpError(404, "not_found", "no such reservation")
+            if row["status"] == "cancelled":
+                raise HttpError(409, "reservation_cancelled", "this reservation is cancelled")
+            if restaurant is None:
+                restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                          (row["restaurant_id"],)).fetchone()
+            elif row["restaurant_id"] != restaurant["id"]:
+                raise _invalid("every booking in a batch must be at the same restaurant")
+            _enforce_cutoff(row, restaurant, "amend")
+
+            # Absent fields keep their stored value, exactly as an amendment's subset does (:192).
+            table_id = item.get("table_id", row["table_id"])
+            starts_at_local = item.get("starts_at_local", row["starts_at_local"])
+            party_size = item.get("party_size", row["party_size"])
+            table, starts = _validate_booking_fields(conn, restaurant, table_id,
+                                                     starts_at_local, party_size)
+            planned.append((reference, table, starts, table_id, starts_at_local, party_size))
+
+        # Pass two: occupancy, in input order, each item applied as it clears.
+        results = []
+        for reference, table, starts, table_id, starts_at_local, party_size in planned:
+            _assert_slot_free(conn, restaurant, table, starts, exclude_reference=reference)
+            # `reference`, `status`, `user_id` and `created_at` are deliberately absent from the SET
+            # list: §11:194 keeps identity, owner and creation time unchanged through a move.
+            conn.execute(
+                "UPDATE reservations SET table_id = ?, starts_at_local = ?, starts_at_utc = ?,"
+                " party_size = ? WHERE reference = ?",
+                (table_id, starts_at_local,
+                 starts.astimezone(dt.timezone.utc).isoformat(), party_size, reference),
+            )
+            moved = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                                 (reference,)).fetchone()
+            results.append(_reservation_body(moved))
+
+        created = (201, {"reservations": results})
+        conn.execute(
+            "INSERT INTO idempotency (key, user_id, scope, request_hash, status_code,"
+            " response_body) VALUES (?, ?, ?, ?, ?, ?)",
+            (key, user["id"], scope, request_hash, created[0], json.dumps(created[1])),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the rollback failure is not the interesting error
+            pass
+        raise
+    finally:
+        conn.close()
+    return created
+
+
+def _validated_moves(body):
+    """§11:185-186, :192 -- the shape of `moves` itself, before any resource is touched.
+
+    Two codes, and the split is the spec's rather than this function's:
+
+    * 422 `validation_failed` for the shape §11:186 names -- the array, its length, each entry being
+      an object, and a "distinct string reference". A `reference` of the wrong JSON type is 422
+      because §11:186 says *string references* in as many words.
+    * 400 `malformed_request` for a wrong-typed `table_id` or `starts_at_local`, which is §5:48's
+      generic wrong-JSON-type rule and is also the code `patch_reservation` already answers with for
+      the same two fields. §11:197 says a move's non-occupancy errors "use ordinary amendment
+      codes", and this is the ordinary amendment code.
+
+    `party_size` stays 422 on purpose. §5:57 makes a wrong-typed `party_size` a 422, which
+    contradicts §5:48, and that contradiction is an open named defect
+    (`party_size_wrong_type_is_422` in `test_spec_stage1.py`) rather than this endpoint's to settle.
+
+    Unknown fields in an item are ignored rather than rejected, per §3:28.
+    """
+    moves = body.get("moves")
+    if not isinstance(moves, list):
+        raise _invalid("moves must be an array")
+    # 0 is out of range as much as 9 is: §11:186 says "1-8 objects", so an empty batch is invalid
+    # rather than a successful no-op.
+    if not 1 <= len(moves) <= _MAX_MOVES:
+        raise _invalid(f"moves must hold between 1 and {_MAX_MOVES} objects")
+    seen = set()
+    for item in moves:
+        if not isinstance(item, dict):
+            raise _invalid("each move must be a JSON object")
+        reference = item.get("reference")
+        if not isinstance(reference, str):
+            raise _invalid("each move needs a string reference")
+        if reference in seen:
+            raise _invalid("move references must be distinct")
+        seen.add(reference)
+        if "table_id" in item and not isinstance(item["table_id"], str):
+            raise _malformed("table_id must be a string")
+        if "starts_at_local" in item and not isinstance(item["starts_at_local"], str):
+            raise _malformed("starts_at_local must be a string")
+        if "party_size" in item and (not isinstance(item["party_size"], int)
+                                     or isinstance(item["party_size"], bool)):
+            raise _invalid("party_size must be an integer")
+    return moves
+
+
 def _reservation_body(row):
     return {
         "reference": row["reference"],
@@ -644,6 +828,7 @@ ROUTES = [
     ("GET", re.compile(r"^/reservations$"), list_reservations),
     ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), get_reservation),
     ("PATCH", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), patch_reservation),
+    ("POST", re.compile(r"^/reservation-moves$"), post_reservation_moves),
     ("POST", re.compile(r"^/reservations/(?P<reference>[^/]+)/cancel$"), cancel_reservation),
 ]
 
@@ -654,9 +839,19 @@ class Request:
     def __init__(self, handler):
         self.handler = handler
         self.headers = handler.headers
+        self.path = urllib.parse.urlsplit(handler.path).path
         self.query = {k: v[-1] for k, v in
                       urllib.parse.parse_qs(handler.path.partition("?")[2]).items()}
         self.user = None
+
+    def idempotency_scope(self) -> str:
+        """§7:79 scopes a replay to "same user, same method, same path, same body".
+
+        Moves is §7's second idempotency-required path, so the path has to be part of the lookup:
+        without it a key spent on create would make the same body on moves look like a replay of
+        the *other* endpoint, which §7:80 forbids in as many words.
+        """
+        return f"{self.handler.command} {self.path}"
 
     def raw_body(self) -> bytes:
         length = int(self.headers.get("Content-Length") or 0)
