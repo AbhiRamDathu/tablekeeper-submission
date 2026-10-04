@@ -390,6 +390,21 @@ def post_reservation(request, match):
     return created
 
 
+def _enforce_cutoff(row, restaurant, what):
+    """409 `cutoff_passed` once `now` is inside the window before the CURRENT start.
+
+    Shared by amendment (:140) and cancellation (:138), which state the same rule. Measured against
+    the stored start and never the requested one: re-anchoring to the new start would let a caller
+    inside the window walk the booking forward to a later slot and keep amending it, which is the
+    thing the cutoff exists to prevent. §4:43 keeps a past start from being an error by itself --
+    the window is the only test, and a booking already inside it simply cannot be touched.
+    """
+    cutoff_at = (dt.datetime.fromisoformat(row["starts_at_utc"])
+                 - dt.timedelta(minutes=restaurant["cancellation_cutoff_minutes"]))
+    if dt.datetime.now(dt.timezone.utc) >= cutoff_at:
+        raise HttpError(409, "cutoff_passed", f"too close to the start to {what}")
+
+
 def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
                      exclude_reference=None):
     """Validate a booking exactly as create does and return `(table, starts)`.
@@ -511,14 +526,7 @@ def patch_reservation(request, match):
 
         restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
                                   (row["restaurant_id"],)).fetchone()
-
-        # The cutoff is measured against the CURRENT start, as the spec insists. Re-anchoring it to
-        # the requested start would let a caller inside the window walk the booking forward to a
-        # later slot and keep amending it, which is the thing the cutoff exists to prevent.
-        cutoff_at = (dt.datetime.fromisoformat(row["starts_at_utc"])
-                     - dt.timedelta(minutes=restaurant["cancellation_cutoff_minutes"]))
-        if dt.datetime.now(dt.timezone.utc) >= cutoff_at:
-            raise HttpError(409, "cutoff_passed", "too close to the start to amend")
+        _enforce_cutoff(row, restaurant, "amend")
 
         # Absent fields keep their stored value, which is what makes the subset literal.
         table_id = body.get("table_id", row["table_id"])
@@ -536,6 +544,66 @@ def patch_reservation(request, match):
             (table_id, starts_at_local, starts.astimezone(dt.timezone.utc).isoformat(),
              party_size, reference),
         )
+        updated = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                               (reference,)).fetchone()
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the rollback failure is not the interesting error
+            pass
+        raise
+    finally:
+        conn.close()
+    return 200, _reservation_body(updated)
+
+
+def cancel_reservation(request, match):
+    """Cancel a booking in place: 200 with its current state, table freed immediately.
+
+    `POST /reservations/{reference}/cancel` is the one endpoint whose success is defined by what it
+    stops rather than what it returns -- :136 asks for "200 with current state" and then for the
+    table to be free "immediately so the next GET /availability offers the slot again". Flipping
+    `status` is sufficient for both, because the availability query (:226) and the booking conflict
+    check both already exclude cancelled rows.
+
+    §7 requires the idempotency key on create and moves only, so none is needed here and none is
+    recorded; the endpoint's own retry story is :137, "already cancelled is 200 not an error".
+    """
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is not None and not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    reference = match.group("reference")
+    conn = store.connect()
+    try:
+        # Read, check and write in one transaction, so a refusal cannot half-apply and the slot
+        # cannot be freed by a cancellation that then failed.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                           (reference,)).fetchone()
+        # Not the caller's is 404, not 403: §5 folds "not visible to this caller" into not_found,
+        # so a 403 would confirm the reference exists.
+        if row is None or row["user_id"] != user["id"]:
+            raise HttpError(404, "not_found", "no such reservation")
+
+        # Already cancelled is 200, not an error -- and deliberately tested BEFORE the cutoff. A
+        # booking cancelled inside the window is inside it forever after, so checking the cutoff
+        # first would turn a successful cancellation into a permanent 409 on retry, which is the
+        # opposite of what :137 asks for.
+        if row["status"] == "cancelled":
+            conn.execute("COMMIT")
+            return 200, _reservation_body(row)
+
+        restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                  (row["restaurant_id"],)).fetchone()
+        _enforce_cutoff(row, restaurant, "cancel")
+
+        # Only `status` moves. §10:175 keeps identities and timestamps from being regenerated, so
+        # `reference`, `reservation_id` and `created_at` all survive a cancellation untouched.
+        conn.execute("UPDATE reservations SET status = 'cancelled' WHERE reference = ?",
+                     (reference,))
         updated = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                (reference,)).fetchone()
         conn.execute("COMMIT")
@@ -576,6 +644,7 @@ ROUTES = [
     ("GET", re.compile(r"^/reservations$"), list_reservations),
     ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), get_reservation),
     ("PATCH", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), patch_reservation),
+    ("POST", re.compile(r"^/reservations/(?P<reference>[^/]+)/cancel$"), cancel_reservation),
 ]
 
 
