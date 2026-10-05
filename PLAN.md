@@ -1,347 +1,532 @@
-# Plan: Tablekeeper Stage 1 — containerized reservation service (rev. 2)
+﻿# Plan: Tablekeeper Stage 1 â€” reconciliation and the remaining two units (rev. 3.40)
 
 ## Goal
 
-Deliver a submission repository whose `stage-1/` folder builds into a container that passes the
-shipped Stage 1 conformance suite in `tablekeeper/test/stage_1/`, verified by the harness itself
-rather than by prose review.
+Close the gap between what the board says and what the tree does, then land the last two units of
+product work: multi-restaurant fixture correctness in `store.py`, and the one-door/one-renderer
+contract that has to be extracted out of `main.py` before it can be fixed.
 
-Source of truth: `tablekeeper/spec/stage-1.md`. Line-level traceability: `REQUIREMENTS.md` at the
-submission repository root.
+Scope of this document: **the measured baseline and the remaining work only.** Rev. 3.33 remains in
+Files as `plan-rev3.33.md` and stays authoritative for anything not restated here â€” the seventeen
+gate names, the requirement citations, and the accumulated review history. What rev. 3.33 got wrong
+about unit status and about line numbers is corrected below and superseded.
 
-## What changed from rev. 1, and why
+---
 
-Rev. 1 was written from the spec prose alone and had no runnable acceptance command anywhere. Four
-defects were found by reading the harness, and all four would have invalidated work already done.
+## Measured baseline â€” 2026-10-05, commit `c816cee`, **clean tree**. Every gate number below is a commit measurement, not a dirty-tree one.
 
-1. **The submission repository did not exist.** Rev. 1 named repo-relative paths (`app/tz.py`,
-   `Dockerfile`) with no root. Every participant in this room gets its own isolated workspace, so
-   "the repo" was nowhere. Nothing could be started, which is why Units 0, 1, 2 and independent
-   verification all sit `in_progress` with no files on disk.
-   **Now:** `C:\Users\linga\Jam\tablekeeper-submission`, git-initialised on `main` by the Planner,
-   with `REQUIREMENTS.md` copied to its root so the Reviewer can read it without entering another
-   runtime's workspace.
-2. **The layout was wrong.** `harness/cli.py:329-336` resolves a submission as
-   `<repo>/stage-1` and hands *that folder* to `docker build` as the context
-   (`harness/docker_driver.py:59-71`). Rev. 1 put `Dockerfile` at the repository root, which a
-   grader running `--repo <clone> --stage 1` rejects outright with
-   "A submission repository holds one folder per stage, named stage-1 through stage-4".
-   **Now:** everything lives under `stage-1/`, so both `--repo … --stage 1` and
-   `--build …\stage-1` work.
-3. **Acceptance was unverifiable.** **Now** every unit carries an exact command below.
-4. **One owner held all nine units.** That is a single serial queue and it is the second reason
-   nothing moved. **Now** the four seats each own a disjoint slice.
+Reproduce with `python -m unittest discover -s tests -t .` from `stage-1/`. Count and exit status
+are the signal; wall clock is not.
 
-A fifth finding is a hard precondition, not a plan defect: see **Toolchain**.
+```
+Ran 250 tests - FAILED (failures=9, skipped=1). 250 is the whole suite.
+  every one of the 9 failures is a named gate defect; nothing else fails.
 
-## Shared paths (all agents, same machine)
+SPEC GATE (Unit 0) - subset assertion - GATE PASSED
+  named defects ............ 17
+    red (named) ............ 9
+    not yet provable ....... 0
+    green .................. 8   auth_returns_display_name
+                                 dockerignore_excludes_copied_source
+                                 idempotency_key_scoped_by_path
+                                 occupancy_scoped_by_restaurant
+                                 reset_spec_shaped_seeded_reservation
+                                 reset_two_restaurants_sharing_table_ids
+                                 slot_end_is_absolute_across_transitions
+                                 unknown_table_is_404
+    declined ............... 1   starts_at_rendered_in_restaurant_zone
 
-| What | Path |
-|---|---|
-| Submission repository (write here) | `C:\Users\linga\Jam\tablekeeper-submission` |
-| Stage-1 answer | `…\tablekeeper-submission\stage-1\` |
-| Harness + spec + tests (read-only) | `C:\Users\linga\Downloads\dark-factory-wearedevs-main\dark-factory-wearedevs-main` |
-| Requirements | `…\tablekeeper-submission\REQUIREMENTS.md` |
+The 9 red: internal_error_message_is_redacted, list_reservations_envelope_and_desc_order,
+opening_hours_in_fixture_order, party_size_wrong_type_is_422,
+reservation_body_has_ends_at_and_created_at, reset_rejects_invalid_fixture,
+restaurants_list_envelope, skipped_local_time_is_invalid_local_time,
+slot_grid_and_opening_hours_codes.
 
-Branch per unit (`unit-0-tz`, `unit-1-loop`, …). Never write to another unit's files; the
-Integrator lands. `--out` directories must be fresh: the harness calls `mkdir(exist_ok=False)` and
-aborts on a collision.
+The 1 skip is declared, not silent:
+  test_a_batch_receipt_survives_an_export_import_round_trip
+    skipped 'GET /_test/export is 404; 205 is unreachable until 10 lands'
+```
 
-## Acceptance commands
+Seventeen, not eighteen. `starts_at_rendered_in_restaurant_zone` is declined on the evidence: the
+spec never constrains the offset of `starts_at`, and `17:00:00+00:00` is the same instant as
+`19:00+02:00`. The gate reports the count; it does not assert it.
 
-Let `H` = `C:\Users\linga\Downloads\dark-factory-wearedevs-main\dark-factory-wearedevs-main`.
-Always run harness commands with `H` as the working directory.
+`not yet provable ....... 0` is itself a fix, not a rounding. The reporter used to derive that set
+from a static dict, so it kept printing the name after the name passed - see rev. 3.40.
 
-**Tier 1 — runs today, no install.** These are the gate for every unit. Standard library only.
+### Rev. 3.40 - the armed defect fired, and the gate was reporting it backwards
 
-| Purpose | Command (cwd = `C:\Users\linga\Jam\tablekeeper-submission\stage-1`) |
-|---|---|
-| Unit tests, whole suite | `python -m unittest discover -s tests -t . -v` |
-| One test module | `python -m unittest tests.test_tz -v` |
-| Start the service | `python -m app.main` (honours `PORT`, default 8080) |
-| Smoke it | `python -c "import urllib.request,json;print(urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).read())"` |
+Measured on the clean tree at `c816cee`. Four commits, in the order they had to land.
 
-**Gate command correction, measured on Python 3.10.11 (rev. 4).** The suite form above only works
-because `stage-1/tests/__init__.py` exists, which the Planner has now created. Verified:
+**1. `occupancy_scoped_by_restaurant` was armed by `8acf056`, and the gate could not say so.**
+`8acf056` keyed `tables` by `(restaurant_id, id)`, which removed the reason the name had been
+blocked: two restaurants can now own a `t_2` each. That is exactly the world the unscoped
+occupancy query gets wrong, so the latent defect became a live one in the same commit that made it
+reachable. Count-monotonicity correctly reported no movement - red before, red after - and
+correctly told nobody that the fix had armed it.
 
-| Form | Result |
-|---|---|
-| `discover -s tests -t . -v` **without** `__init__.py` | `ImportError: Start directory is not importable` |
-| `discover -s tests -t . -v` **with** `__init__.py` | runs the suite, OK |
-| `discover -s . -p "test_*.py" -v` without `__init__.py` | **exits 0 after running 0 tests — a silent false green** |
-| `discover -s tests -t tests -v` without `__init__.py` | works |
-| `python -m unittest tests.test_tz -v` without `__init__.py` | works |
+The arming probe, measured, before the fix:
 
-Two consequences. Never use the `-s . -p` form: it reports success without running anything, which
-is precisely the false pass this plan forbids. And treat "Ran 0 tests" as a failure in any report —
-a Tier 1 result of zero tests is not a pass, it is an unrun gate.
+```
+r_one books t_2 .................................. 201
+r_two still offers its own t_2 at the same slot .. true
+r_two may book the same table id at the same time . expected 201, got 409
+```
 
-**Tier 2 — grading gates, blocked on the owner.** Run with `H` as cwd once `httpx`/`pytest` exist.
+The middle leg passing beside a failing third leg is the whole diagnosis. `GET /availability`
+filtered by `restaurant_id` and so *offered* `t_2`, while the booking path read occupancy by
+`table_id` alone and refused it. An offered table that cannot be booked, and the two paths disagreed
+about whose table `t_2` was. Fixed at `c55da5d`.
 
-| Purpose | Command |
-|---|---|
-| Whole Stage 1, dev loop (service already running on 8080) | `python -m harness run --track tablekeeper --base-url http://127.0.0.1:8080 --stages 1 --out runs/<fresh>` |
-| One Stage 1 file | `python -m pytest tablekeeper\test\stage_1\test_reservations.py --base-url http://127.0.0.1:8080 -p harness.plugin --rootdir tablekeeper\test -q` |
-| Counts for a run | read `runs\<fresh>\stage-1.counts.json` |
+**2. The gate reported a passing name as unprovable.** `_report` built the not-yet-provable set
+from `BLOCKED`, a static dict, rather than from the run - so the name stayed excluded from the
+green list after it went green, and a real fix was invisible in the instrument meant to record it.
+`_report` now derives the set from `result.skipped`, which is the only evidence that a cause went
+unchecked, and reports any named defect that skipped even without a declared blocker so an
+unexpected skip cannot be counted as green. Same commit as the product fix.
 
-**Tier 3 — the grading architecture, blocked on Docker.**
+**3. A shipped test outlived the behaviour it described.** `main.py` answered an unknown
+`table_id` with 404 `not_found` while `test_service.py` still asserted 422 - the product half of
+Unit 5's rule had landed without the test half. Fixed at `442ac48`, both halves in one commit,
+because either alone leaves a failure and the failing test was the only thing reporting the split.
 
-| Purpose | Command |
-|---|---|
-| Whole Stage 1, container path — **this is grading** | `python -m harness run --track tablekeeper --repo C:\Users\linga\Jam\tablekeeper-submission --stage 1 --mode isolated --out runs/<fresh>` |
+**4. The idempotency migration decided under a lock it did not hold.** Fixed at `c816cee`; see
+that commit's message. Both its tests were run against the pre-fix `store.py` and observed to fail,
+so the pair is an instrument rather than an assertion of intent.
 
-A unit is not done because Tier 1 passes. Tier 1 is the gate that lets work proceed; Tier 2 and
-Tier 3 are what decide whether it is submitted. Say which tier you reached, and never report a
-tier you did not run.
+### What has actually landed
 
-## Toolchain — measured, re-checked 2026-10-02
+| Unit | Task | State | Evidence |
+|---|---|---|---|
+| 1a | #1 | **done** | `stage-1/.dockerignore` no longer excludes `app/`; `Dockerfile:10 COPY app ./app` now resolves |
+| 1b | #6 | **done** | `stage-1/tests/test_packaging.py` exists; gate name green |
+| 1d | #8 | **done** | `stage-1/tests/test_runtime_contracts.py` exists; commit `4405a80` |
+| 0 | #5 | **done** | `stage-1/tests/test_spec_stage1.py` exists; gate PASSES; 17 names, subset assertion live |
+| 10 | #3 | **done** | `app/intervals.py` exists; commit `ef97421`; gate name green |
+| 4 | #4 | **done** | commit `9bf2220`; gate name green |
+| 2 | #7 | **partial** | defect 18 and the `send_error` override landed (`3adc2d8`, `f3e654d`); **the extraction has not started** |
+| 5 | #10 | **partial** | moves contract landed (`d4fe50e`, `750743c`, `ea6c446`); input order and the `table_id` 404 landed at `dacc02c`/`442ac48`; the door/renderer has not started |
+| 3 | #2 | **done** | commit `8acf056`; composite key plus whole-fixture validation. Armed-defect follow-on landed at `c55da5d` - occupancy now scoped, `occupancy_scoped_by_restaurant` red -> green |
+| 1c | #9 | **blocked** | `docker` is not on `PATH` on this host |
 
-| Tool | State on this machine | Consequence |
+The board showed ten tasks `in_progress` at rev 3.36. It shows **eleven** at rev 3.37: ten
+with an assignee, one without. Six of them are finished. **The Planner cannot correct this**:
+`work room-status` updates only *your own* assignment. Each owner marks their own task, and `#7` is
+the one that has to close, because its landed half is green and `#11` now carries the extraction.
+That is the durable version of "authorship is not ownership", pointed the other way.
+
+### Every `main.py` line anchor in the plan is stale. Use content anchors.
+
+`main.py` has been edited four times since those anchors were written. Verified anchors, current tree:
+
+| Plan said | Actually | Content to search for |
 |---|---|---|
-| Docker | **absent** — `docker` is not on PATH | The grading command `--mode isolated` cannot run. |
-| `httpx` | **absent** — `ModuleNotFoundError: No module named 'httpx'` | The shipped harness suite cannot run. |
-| `pytest` | **absent** — `ModuleNotFoundError: No module named 'pytest'` | Rev. 2's per-unit pytest commands cannot run. |
-| Python | 3.10.11, `zoneinfo` + tzdata working | Fine. Container pins 3.12. |
-| git | 2.53.0 | Fine. |
+| `main.py:369` unknown table | `main.py:425` | `raise _invalid("no such table at this restaurant")`, directly after `SELECT * FROM tables WHERE id = ? AND restaurant_id = ?` at `:421` |
+| `main.py:388` occupancy query | `main.py:450-451` | `SELECT starts_at_utc FROM reservations` + `WHERE table_id = ? AND status != 'cancelled'` â€” still no `restaurant_id` |
+| `main.py:508-509` catch-all | `main.py:903` | `except Exception` in `_dispatch` â€” already redacted, gate name green |
+| `main.py:66-67` `/health` | unchanged | `return 200 with status ok` |
 
-Nothing has been installed since rev. 2. The single ask to the owner stands:
-`python -m pip install -r <harness>\harness\requirements.txt`, plus a Docker install.
+Anchors that still hold: `app/store.py:47` (`id TEXT PRIMARY KEY`), `app/store.py:103-116`
+(`BEGIN IMMEDIATE` / `ROLLBACK`), `app/tz.py:62` (`raise InvalidLocalTime(str(exc) from exc)`),
+`app/auth.py:99` (inspects exception text, never interpolates â€” **do not fix**), and every
+`test_service.py` line the plan cites: `:390/:393`, `:395/:405`, `:407/:413`, `:415/:418`.
 
-## Decision (rev. 3): the service depends on nothing
+**A rev 3.35 must not introduce a new `main.py:NNN`.** Cite the string.
 
-Waiting on that install would idle four seats. Instead the service is built on the standard library
-only — `http.server.ThreadingHTTPServer`, `sqlite3`, `zoneinfo`, `hashlib`, `secrets`, `json`,
-`base64` — with **no pip requirement in the image at all**, and unit tests written as `unittest`
-cases driven by `urllib` against a locally started service.
+---
 
-This is measured, not assumed. The Planner ran a probe on this machine with zero third-party
-packages installed. Observed output:
+## Unit 3 â€” multi-restaurant fixture correctness
 
-```
-test_fifty_concurrent_requests_produce_no_5xx (__main__.Probe) ... ok
-test_health_and_reset_against_a_live_server (__main__.Probe) ... ok
-----------------------------------------------------------------------
-Ran 2 tests in 1.084s
+- Owner: Implementer (already assigned, task #2)
+- Files: `app/store.py` only. Nothing else.
+- Depends on: nothing. Start now.
+- Deliverable: `tables` keyed `(restaurant_id, id)`; the whole fixture validated against the model
+  before the transaction opens; lock failure handled per path kind.
+- Turns green: `opening_hours_in_fixture_order`, `reset_rejects_invalid_fixture`,
+  `reset_spec_shaped_seeded_reservation`, `reset_two_restaurants_sharing_table_ids`.
+- Unblocks: `occupancy_scoped_by_restaurant`, which is `blocked_on` the last of those.
+- Acceptance:
+  - `python -m unittest discover -s tests -t .` from `stage-1/` reports **10 red**, and
+    `occupancy_scoped_by_restaurant` moves from *not yet provable* into the red list or green â€” one
+    or the other, and either is a result. Report which.
+  - Reset with two restaurants sharing `t_1..t_3` returns **204**.
+  - Lock rule, by path kind. **Request paths:** a lock failure is 409 `table_unavailable` or a
+    retryable 4xx, never 500. **Reset:** retries inside its own 10 s budget (`REQUIREMENTS.md:16`) and
+    answers 204 or 422, never 409, never 500. State in your completion notes what reset does when the
+    budget is genuinely exhausted â€” see Open question 1.
+  - **Arming probe, mandatory, manual, in your completion run.** This unit converts a latent defect
+    into a live one and the gate cannot see it. `occupancy_scoped_by_restaurant` is red before you
+    land and red after, so count-monotonicity correctly reports *no movement* and correctly tells
+    nobody that your commit just armed it. So: land the composite key, then in an **immediate
+    follow-on commit** add `AND restaurant_id = ?` to the unscoped query â€” content anchor
+    `WHERE table_id = ? AND status != 'cancelled'`, with a `restaurant["id"]` parameter. Book
+    `r_anker/t_2`, read `r_ny` availability, confirm `n_2` is offered. Report either way. The fix has
+    a working example twenty lines above the defect in the same function
+    (`SELECT * FROM tables WHERE id = ? AND restaurant_id = ?`), and it is a query change, not a
+    schema change, which is why it cannot live in your Files line and why it cannot wait behind
+    Unit 5.
+  - No `error.violations` key, ever. A 422 is exactly two keys
+    (`REQUIREMENTS.md:47`): `{"error":{"code":...,"message":...}}`, first-error-wins, message names
+    the failing path (`restaurants[0].tables[2].capacity must be a positive integer`). Validate the
+    **whole** fixture before opening the transaction â€” that ordering is the only thing making
+    first-error-wins safe here.
 
-OK
-```
+## Unit 2 â€” extract `main.py` (this is what gates Unit 5)
 
-That probe served `GET /health` as 200 `{"status":"ok"}`, `POST /_test/reset` as 204 writing a
-fixture inside one `BEGIN IMMEDIATE` transaction, and survived 50 concurrent requests with zero
-5xx on `ThreadingHTTPServer`.
+- Owner: Integrator (task #9's seat is blocked on an absent Docker, and this is the work that
+  actually moves the submission)
+- Files: `app/main.py`, and it creates `app/routes.py`, `app/service.py`, `app/errors.py`,
+  `app/validation.py`, `app/render.py`, `app/idempotency.py`
+- Depends on: nothing. **Disjoint from Unit 3** â€” it reads `store.py`, it does not edit it.
+- Deliverable: `main.py` under 200 lines containing **no SQL**. Today it is **874 lines with 33 SQL
+  statements**, so this is a real move, not a tidy-up.
+- Turns green: nothing. This unit is behaviour-preserving and its only output is that Unit 5 becomes
+  writable.
+- Acceptance:
+  - `python -m unittest discover -s tests -t .` from `stage-1/` reports **the same 11 red and the
+    same 5 green** as the baseline above. Same names, not the same count â€” an unnamed failure means
+    the refactor changed behaviour, and it is the signal that stops the run being believed.
+  - `main.py` under 200 lines; zero SQL statements in it.
+  - `app/main.py` reads `store.py`. It does not edit it.
+  - Already-landed and must survive the move byte-for-byte in behaviour: the defect-18 redaction, the
+    `send_error` override so a 501 is a JSON envelope, `do_PATCH`, `do_DELETE`.
+- **Do not cut an instrument for this.** The gate *is* the characterisation suite: 17 names, subset
+  assertion, 158 tests. A refactor this size with no behavioural net is the one thing in this plan
+  that could pass a green build and lose a requirement.
 
-Three reasons this is the right call rather than a workaround:
+## Unit 5 â€” one door, one renderer (gated on Unit 2)
 
-1. **It removes the blocker instead of waiting on it.** Every unit except the final image proof is
-   now verifiable today, with no install and no permission.
-2. **It fits the spec better.** "No outbound network at run time" becomes trivially true — there is
-   nothing to fetch. A dependency-free `python:3.12-slim` image starts inside the 60 s health
-   deadline with room to spare.
-3. **It costs nothing later.** `unittest`-style tests are collected by `pytest` unchanged, so the
-   moment `httpx` is installed the shipped harness suite runs against the same code and the same
-   tests. No rework.
+- Owner: unassigned until Unit 2's files exist. **Do not start it against `main.py`** â€” its Files
+  line names six modules that are not on disk, and that is exactly the coupling file overlap hides.
+- Files: `app/validation.py`, `app/render.py`, `app/idempotency.py`, `app/routes.py`, `app/service.py`,
+  and `app/tz.py` for line 62 only.
+- Depends on: Unit 2.
+- Turns green: `restaurants_list_envelope`, `list_reservations_envelope_and_desc_order`,
+  `reservation_body_has_ends_at_and_created_at`, `slot_grid_and_opening_hours_codes`,
+  `unknown_table_is_404`, `skipped_local_time_is_invalid_local_time`, and
+  `party_size_wrong_type_is_422` subject to Open question 2.
+- Acceptance:
+  - One validation function, one renderer. `create`, `PATCH` and moves all go through both â€” three
+    endpoint-local copies would each be individually correct and jointly wrong.
+  - `unknown_table_is_404` is a **one-line** change at `raise _invalid("no such table at this
+    restaurant")` to `HttpError(404, "not_found", ...)`, in the **same commit** as the correction of
+    `test_service.py:415/418`. Neither before nor after the other.
+  - `test_service.py:390/393` â†’ 422 `party_exceeds_capacity`; `:395/405` â†’ 422 `invalid_local_time`.
+    Same rule: same commit as the product fix, same owner.
+  - `app/tz.py:62` routes `str(exc)` through the same shared helper as the other sites.
+  - `app/auth.py:99` is **not** touched. It inspects exception text for control flow and never
+    interpolates; rewriting it deletes duplicate-email detection and returns 500 where the spec wants
+    409.
+  - Report: **10 red** if Unit 3 has landed, **9 red** if it has not, and the names either way.
 
-What it does **not** replace: `--mode isolated` is still the grading path and still needs Docker,
-and the shipped suite still needs `httpx`. Unit 8 stays blocked on the owner. Nothing else is.
+## Unit 1c â€” blocked, and it stays blocked
 
-**Concurrency note that follows from this:** `ThreadingHTTPServer` is the default choice precisely
-because the spec requires 50 concurrent in-flight requests with no 5xx, and a single-threaded
-server would fail that immediately. Pair it with SQLite in WAL mode and `BEGIN IMMEDIATE` for
-write transactions; that is what makes §7 and §11 atomicity achievable without extra dependencies.
+- Owner: Integrator, task #9. `docker` is not on `PATH` on this host; it has been absent since the
+  start of this room.
+- Everything reachable without Docker has already been re-homed: the tzdata build-dependency guard
+  is task #8 and is green; the packaging guard is task #6 and is green; the 50-concurrent no-5xx
+  bound and the `{201:1, 200:19}` idempotency tally are asserted by two shipped tests
+  (`test_concurrent_identical_requests_book_twice`,
+  `test_fifty_concurrent_requests_produce_no_5xx`) â€” **reference them, do not clone them**, because a
+  clone inflates the gate's own count and makes seventeen harder to defend.
+- Mark the task `blocked` with that reason. Do not report a build result from any stdlib stand-in.
 
-**Language pin:** the container is `python:3.12-slim`; the host runs 3.10.11. Do not use 3.11+ only
-syntax (e.g. `typing.Self`) or the host cannot run the tests that prove the image works.
-
-## Unit 1: Build-to-test loop, schema, reset — *reordered to first*
-
-- Owner: Integrator
-- Files: `stage-1/Dockerfile`, `stage-1/app/main.py`, `stage-1/app/store.py`,
-  `stage-1/app/schema.sql`, `stage-1/requirements.txt`
-- Depends on: nothing
-- Deliverable: a service that starts, answers `/health`, and accepts `/_test/reset`, plus the
-  `Dockerfile` that will carry it. Stdlib only — `ThreadingHTTPServer` + `sqlite3`, no pip
-  requirement in the image.
-- Acceptance, split by tier, and say which tier you reached:
-  - **Tier 1, runs today:** `python -m unittest tests.test_loop -v` passes, covering
-    `GET /health` → 200 `{"status":"ok"}`, `POST /_test/reset` → 204 unauthenticated writing the
-    whole fixture in one `BEGIN IMMEDIATE` transaction, repeated resets supported, and 50 concurrent
-    requests producing zero 5xx. `python -m app.main` starts and honours `PORT`.
-  - **Tier 2, blocked:** the harness suite runs against it and `runs\<fresh>\stage-1.counts.json`
-    exists.
-  - **Tier 3, blocked on Docker:** `docker build -t tablekeeper-s1 C:\Users\linga\Jam\tablekeeper-submission\stage-1`
-    exits 0, and `--mode isolated` reaches the suite instead of failing at "docker is not installed".
-  - Dockerfile pins `python:3.12-slim`, honours `-e PORT` (default 8080), binds `0.0.0.0`, copies
-    `app/`, installs nothing from the network at run time.
-
-Why first: if the build-to-test loop does not exist, no later unit can be proven and the defect
-would surface only at the end of the stage, after all nine units were written. Everything else in
-this plan is worthless without this loop.
-
-## Unit 0: DST and absolute-interval core
-
-- Owner: Implementer
-- Files: `stage-1/app/tz.py`, `stage-1/app/intervals.py`, `stage-1/tests/test_tz.py`
-- Depends on: nothing (parallel to Unit 1)
-- Deliverable: pure functions for local-time resolution and half-open occupancy intervals. No HTTP,
-  no DB, no import of anything outside the standard library.
-- Acceptance (Tier 1, runs today): `python -m unittest tests.test_tz -v` passes for Europe/Berlin
-  2026-03-29 and 2026-10-25, America/New_York 2026-03-08 and 2026-11-01, plus the §1 adjacency
-  case where a 90-minute booking at 19:00 does not conflict with one starting 20:30.
-  Write the tests as `unittest.TestCase`; pytest collects them unchanged later.
-
-Why second-in-line but genuinely parallel: the highest *domain* risk, and it is pure. If local-time
-resolution is wrong, availability, booking, amendment and batch moves are wrong together.
-
-## Conformance suite and one verify command
-
-- Owner: Test author
-- Files: `stage-1/tests/verify.ps1`, `stage-1/tests/README.md`
-- Depends on: nothing
-- Deliverable: a script that starts nothing, assumes a service on 8080, runs the whole Stage 1
-  suite, and prints pass/fail counts plus the failing node IDs. One command, so every later unit
-  reports the same evidence instead of an assertion about its own code.
-- Acceptance: `powershell -File stage-1\tests\verify.ps1` run from the harness root exits 0 and its
-  output contains the Stage 1 counts; with the service stopped it exits non-zero and says the
-  service was unreachable.
-
-Why this seat: Rev. 1 left the Test author idle while the Implementer queued nine units. The suite
-is what converts "looks right" into "verified", and it is reusable by every subsequent unit.
-
-## Unit 2: Authentication
-
-- Owner: Implementer
-- Files: `stage-1/app/auth.py`
-- Depends on: nothing (parallel to Units 0 and 1)
-- Deliverable: signup, login, bearer token issuance and lookup
-- Acceptance: `python -m pytest tablekeeper\test\stage_1\test_health_reset_auth.py --base-url http://127.0.0.1:8080 -p harness.plugin --rootdir tablekeeper\test -q`
-  passes; signup 201, login 200, 409 `email_taken`, 422 for a password under 8 characters and for
-  an email not of the form `local@domain`, 401 `unauthenticated` on wrong password or unknown
-  email, no plaintext password at rest.
-
-## Unit 3: Public read endpoints
-
-- Owner: Implementer
-- Files: `stage-1/app/api_public.py`
-- Depends on: Units 0, 1
-- Deliverable: `GET /restaurants`, `GET /restaurants/{id}`, `GET /availability`
-- Acceptance: `python -m pytest tablekeeper\test\stage_1\test_restaurants_availability.py --base-url http://127.0.0.1:8080 -p harness.plugin --rootdir tablekeeper\test -q`
-  passes; all three need no bearer token; a missing required query parameter is 422
-  `validation_failed`; a closed weekday returns `"slots": []`; a slot with no free table still
-  appears with an empty `available_table_ids`; table order follows the fixture.
-
-## Unit 4: Idempotency engine and reservation write path
-
-- Owner: Implementer (single owner — see coupling note)
-- Files: `stage-1/app/idempotency.py`, `stage-1/app/api_reservations.py`, `stage-1/app/service.py`
-- Depends on: Units 0, 1, 2, 3
-- Deliverable: `POST /reservations`, `GET /reservations`, `GET /reservations/{reference}`
-- Acceptance: the full §7 table — absent or empty key 400 `missing_idempotency_key`; first use
-  201; replay 200 with an identical JSON value; different body 409 `idempotency_key_reuse`; a key
-  whose original request failed 4xx is reusable; key length outside 1–255 is 422; a burst of
-  concurrent identical requests on one unused key yields exactly one 201 and the rest 200 with the
-  same body, applying the operation once.
-
-Coupling note: the idempotency table, the reservation write path and the service layer are one
-owner. Split across two seats they produce two individually correct changes that are jointly broken,
-because a key is only reusable if the failure that stored it was rolled back with the reservation.
-
-## Unit 5: Cancel and amend
-
-- Owner: Implementer
-- Files: `stage-1/app/api_reservations.py`, `stage-1/app/service.py`
-- Depends on: Unit 4
-- Deliverable: `POST /reservations/{reference}/cancel`, `PATCH /reservations/{reference}`
-- Acceptance: covered by `stage-1\test_reservations.py`; cancelling twice returns 200 with current
-  state, not an error; within `cancellation_cutoff_minutes` of start returns 409 `cutoff_passed`; a
-  cancelled reservation returns 409 `reservation_cancelled`; a failed amendment leaves the original
-  booking and its occupancy unchanged; `reference` and `reservation_id` survive an amendment; the
-  table is offered again in `GET /availability` immediately after a cancel.
-
-## Unit 6: Export and import
-
-- Owner: Implementer
-- Files: `stage-1/app/api_testcontrol.py`, `stage-1/app/portability.py`
-- Depends on: Unit 4
-- Deliverable: `GET /_test/export`, `POST /_test/import`
-- Acceptance: export 200 with `track: "tablekeeper"`, `format_version: 1` and opaque `state`; import
-  204 and atomic; a round trip against a *changed* destination preserves accounts, hashed-password
-  login, existing bearer tokens, references, completed idempotent request bodies and their original
-  responses, and leaves previously failed keys reusable; identities, statuses and timestamps are not
-  regenerated; missing fields, wrong track or version, or invalid state give 422 with the
-  destination unchanged.
-
-## Unit 7: Atomic reservation moves
-
-- Owner: Implementer
-- Files: `stage-1/app/api_moves.py`
-- Depends on: Units 4, 5
-- Deliverable: `POST /reservation-moves`
-- Acceptance: 1–8 items with distinct references; 404 for unknown or another owner's reference; 422
-  for different restaurants or duplicate references; 409 `reservation_cancelled`; non-occupancy
-  errors use ordinary amendment codes and take precedence in input order with cutoff errors ahead of
-  other changes for that booking; overlap yields 409 `table_unavailable`; either every move commits
-  or nothing changes including retry keys; success 201 with reservations in input order including
-  unchanged items; replay 200 with that original response even after later amendment or
-  cancellation.
-
-## Unit 8: Container hardening and evidence
-
-- Owner: Integrator
-- Files: `stage-1/Dockerfile`, `stage-1/RUN.md`
-- Depends on: Units 3–7
-- Deliverable: an image that survives the grading architecture, not just a local build
-- Acceptance: the container-path harness command above reports PASS for Stage 1; 50 concurrent
-  in-flight requests produce no 5xx and each completes within 5 s (`/_test/reset` within 10 s); the
-  service makes no outbound request at run time, proven by running the grading command with
-  `--mode isolated` on an `--internal` network where a fetch would simply fail.
-
-## Independent verification
-
-- Owner: Reviewer
-- Files: writes `stage-1/docs/verification.md`; reads everything else, writes no implementation
-- Depends on: Unit 0 first, then each subsequent unit
-- Deliverable: one finding per spec section, each with the command run and its observed output
-- Acceptance: `stage-1/docs/verification.md` confirms or refutes §7 ordering, §11 atomicity, §9
-  DST resolution, §5 status/code mapping and §10 portability, citing
-  `<fresh>\stage-1.counts.json` from a run the Reviewer started. Read
-  `C:\Users\linga\Jam\tablekeeper-submission\REQUIREMENTS.md` — it is in the shared repository
-  precisely so this task does not require entering another runtime's workspace.
-
-Why Rev. 1's version of this task stalled: it was scoped "read-only against the implementation and
-`REQUIREMENTS.md`" when no implementation existed and `REQUIREMENTS.md` lived only in the Planner's
-private workspace. There was literally nothing the Reviewer could open.
+---
 
 ## Risks
 
-- **No toolchain.** Docker and `httpx`/`pytest` are absent, so no harness command runs. Earliest
-  observation: Unit 1's acceptance failing at "docker is not installed" or `ModuleNotFoundError`.
-  Owner action required; see the ask.
-- **Layout drift back to repo root.** Earliest observation: `--repo … --stage 1` rejecting with
-  "holds no stage folder". Any file added outside `stage-1/` is not part of the submission.
-- **DST resolution implemented twice or inconsistently.** Earliest observation: Unit 0's four
-  transition tests disagreeing on the ambiguous hour.
-- **Idempotency bound at the wrong layer.** §7 resolves the key after the body parses as an object
-  and after authentication, but before endpoint field validation. Late binding passes
-  single-threaded tests and fails the 409-on-invalid-body case.
-- **Export/import regenerating something it must preserve.** Earliest observation: a round-trip that
-  passes against a fresh reset and fails against a changed destination. §10 says explicitly that a
-  fresh fixture does not satisfy the requirement.
-- **Races invisible locally.** 50 concurrent in flight with no 5xx is a stated limit;
-  single-threaded testing will not surface it. Only the container path exercises it.
-- **Host mode flatters the build.** `harness/docker_driver.py:6-15` warns that host mode does not
-  block outbound traffic, so a service that fetches a CDN passes locally and fails grading. Never
-  score from host mode.
-- **Scope.** Four days against a Stage 1 larger than Stages 2–4 combined.
+- **The two units are disjoint by file and coupled by import.** Unit 2 creates the modules Unit 5
+  edits. If Unit 2 lands and Unit 5 has already been started against `main.py`, one Implementer has
+  two sets of edits in the same logic and the merge is done by hand. Earliest observation: Unit 5's
+  task being `in_progress` while `app/routes.py` does not exist.
+- **Unit 3 arms a live defect and the gate is blind to it by construction.** Handled by the mandatory
+  follow-on commit and the arming probe, both in Unit 3's acceptance. Earliest observation: composite
+  key merged with the unscoped query still unfixed.
+- **`main.py` anchors rot again.** Handled by banning `main.py:NNN` from rev 3.35 onward. Earliest
+  observation: any new task or plan text citing a `main.py` line number.
+- **Docker-gated evidence does not exist and will be graded.** Unit 1c's acceptance is unrunnable
+  here. Report it as UNRUN, never as passing. A2 (60 s to healthy) and the harness run
+  (`python -m harness run --mode isolated`) are unverified on this host and must be labelled so.
+- **The seventeen are not a coverage claim.** They are a floor: every failure is a *named* failure.
+  Five uncovered areas found at rev 3.5 have gained names; the half of the spec surface those names
+  do not touch is still only covered by the shipped 70.
 
 ## Open questions
 
-- **Are stage gates cumulative, and what does the rubric weight?** `kickoff-manifest.json` and
-  `docs/participant-guide.md` are unverified — a read of the manifest was declined, so the plan does
-  not assume its contents. Not blocking: Stage 1 is required under any answer. Blocks planning past
-  Stage 1. **This is the second thing I need from the owner, and it is not urgent.**
-- **Spec ambiguities.** The README routes these to the BAND Discord, where answers are public.
-  Anything the Reviewer cannot resolve from the spec text should be raised there rather than decided
-  locally.
-- **Docker.** No `Dockerfile` can be proven buildable on this machine until Docker is installed. If
-  it cannot be installed, say so and I will re-plan Unit 8 and Unit 1's acceptance around host mode
-  only, accepting the grading risk explicitly rather than silently.
+1. **What does `POST /_test/reset` answer when its 10 s lock budget is genuinely exhausted?**
+   Escalated to the owner at rev 3.17 and still unanswered. `REQUIREMENTS.md:23` pins reset to 204;
+   `REQUIREMENTS.md:17` forbids 5xx outright; if the budget is exhausted the fixture was not
+   committed, so no honest 204 exists. 422 is unavailable too â€” exhaustion is not "a stated rule
+   violated" per `:54`. **Recommendation: 503 with `Retry-After`, as a recorded deviation from `:17`,
+   because the only way to keep `:17` is a 204 that lies.** `transaction()` at `store.py:103-116` is
+   `BEGIN IMMEDIATE` with `ROLLBACK`, so a lock failure leaves the *previous* fixture intact and a
+   204 would hand the harness a stale world that every later assertion then runs against. 500 is
+   acceptable if preferred. **204 is not, under any reading.** Blocks: one line in Unit 3.
+2. **Is a wrong-*type* `party_size` a 400 or a 422?** Put to the owner this revision; no answer yet.
+   `REQUIREMENTS.md:48` says 400 for a wrong JSON type; `:57` says 422 for invalid `party_size`
+   *including strings and booleans*; `:129` says 422 for not-an-integer.
+   `test_service.py:407/413` asserts 400 and is shipped; gate defect `party_size_wrong_type_is_422`
+   asserts 422 and is red. **Recommendation: 422.** `:57` names strings explicitly, so it covers
+   `"four"` directly and a specific rule beats a general one; read `:48` as governing fields other
+   than `party_size`. **This withdraws the pending KEEP-400 recommendation at rev 3.15**, which read
+   `:57`/`:129` as applying only after coercion to `int` â€” that reading makes the words "including
+   strings" meaningless. Whatever is ruled, the shipped test and the product defect move in **one
+   commit by one owner**, never before. Blocks: one named defect of eleven.
+
+## Reading this room without reading a ghost â€” rev. 3.35 addition
+
+### Do not reconstruct the board
+
+**Run the instrument, do not reconstruct the board.**
+
+```
+python C:\Users\linga\Jam\tablekeeper-submission\docs\board_verify.py        # board + live plan pointer
+python C:\Users\linga\Jam\tablekeeper-submission\docs\board_verify.py --gate # also run the Unit 0 spec gate
+```
+
+In Files as `board-verify-rev3.37.py`. It fetches the board and the live plan path itself,
+prints the fetch timestamp, and **refuses to report** a board whose task count is 6 or 7, or a plan
+of 85595 bytes - it prints the known-stale warning instead. Exit code 2 means the fetch failed:
+report no board at all. Three check modes, each with its own exit code:
+
+```
+python docs\board_verify.py --check FILE   # is this copy live?   0 = live, 1 = no
+python docs\board_verify.py --selftest     # do the markers hold? 1 = contaminated
+python docs\board_verify.py --gate         # also run the Unit 0 spec gate
+```
+
+**Why this rule exists, measured.** The room Files catalogue held 76 snapshots, **33 of them named
+exactly `plan.md`, carrying 33 different byte sizes** from 8624 to 251929. Four consecutive reviews
+in this room filed verdicts against one of them. The one the Reviewer opened was
+`art-ff4771280b09e2f7f4f90b8d`, sha256 `ecf54ce9â€¦`, 85595 bytes, first line
+`# Plan: â€¦ (rev. 3.6)` â€” verified against the store, and matching the sha and byte count the
+Reviewer independently reported. It was reading rev. 3.6 while the live plan was 3.33, and its
+board block was headed `===== board48956829`, which is not the output format of `jam work board` at
+all. A board reconstructed from a document cannot be corrected by re-reading the document.
+
+Standing rules, all of them earned:
+
+1. The live plan is whichever snapshot `plan show` names. Never pick one from Files by name.
+2. A board is `work board <room-id> --json`, read per-task, never summarised from prose.
+3. `started_at` reads 0 on every task and is not a signal. Occupancy is `assignments[].status`.
+4. Never cite a line number in `app/main.py`. It moved four times in three hours. Cite the string.
+5. Publish snapshots as `plan-rev<N>.md`, never as `plan.md`.
+6. **Validate any plan copy by content, in both directions, before reasoning about it.**
+
+   ```
+   python C:\Users\linga\Jam\tablekeeper-submission\docs\board_verify.py --check <file>
+   ```
+
+   Exit 0 = live. Exit 1 = dead, or not the live revision, and the script says which. It works on any
+   copy, and it cannot be fooled by a republished header, because it never looks at a filename.
+   `--selftest` is the other half: it fetches the live plan and asserts the markers against it, so a
+   contaminated marker is caught at publication time instead of misleading the next reader.
+
+   A one-sided check is not sufficient, and this is measured rather than asserted. Counts are
+   `Select-String -SimpleMatch` line hits, measured 2026-10-05. Dead column = the rev 3.6 artifact
+   `art-ff4771280b09e2f7f4f90b8d` (sha `ecf54ce9...`). Live column = this revision.
+
+   | alias | rev 3.6 | live | use |
+   |---|---|---|---|
+   | STALE-1 | 1 | 0 | **must be absent** - a hit proves dead |
+   | MUST-PRESENT-1 | 0 | 2 | **must be present** - a miss proves not live |
+   | MUST-PRESENT-2 | 0 | 6 | **must be present** |
+   | MUST-PRESENT-3 | 0 | 2 | **must be present** |
+   | `never 409, never 500` | 2 | 2 | **not a discriminator** |
+   | `internal_error_message_is_redacted` | 2 | 2 | **not a discriminator** |
+
+   **Markers are named by alias in this plan, never by literal. The literals live only in
+   `docs/board_verify.py`.** That is not a style rule. Rev. 3.35 published STALE-1 verbatim in the
+   table above, so the live plan quoted the one string that identifies a dead revision - and
+   `--check` on the live plan answered `DEAD REVISION`, exit 1, on 2026-10-05:
+
+```
+> python docs\board_verify.py --check <live rev 3.36>
+STALE    <the STALE-1 literal>
+ok       Reading this room without reading a ghost
+ok       Retry-After
+ok       Do not reconstruct the board
+VERDICT: DEAD REVISION. ... Do not reason about this file. Re-fetch with plan show.
+exit=1
+```
+
+   The STALE-1 line above is elided in this plan on purpose. The first draft of this revision pasted
+   it verbatim as evidence and the count went straight back to 1 - the same defect, reintroduced by
+   the fix that documents it. If you re-paste real output here, redact the stale marker.
+
+   The instrument built to stop a reader trusting a dead revision pushed them off the only correct
+   file in the room. The generalisable rule: **a marker must not be quoted by the revision it tests**,
+   because the newest revision has to explain the old markers in order to be useful at all. Fixed at
+   this revision: `--check` on the live plan exits 0, `--check` on the rev 3.6 artifact exits 1.
+
+   **All three strings offered as stale markers on 2026-10-05 fail, for two different reasons.** The
+   two `not a discriminator` rows read 2 in rev 3.6 *and* 2 here, so neither discriminates: applied as
+   a stale test each returns "not dead" for the dead copy too, and would have **missed** the stale
+   read they were offered to catch. STALE-1 was contaminated by the self-reference above. A marker is
+   valid only when the two columns differ, and a stale marker only when the live column is 0.
+   The asymmetry that makes this survivable: a MUST-PRESENT marker may gain hits every time a
+   revision quotes it, which is harmless, so the live column for those rows drifts upward and is
+   only ever a floor. A MUST-ABSENT marker has no such slack - one hit condemns the file.
+
+   And the inversion worth noticing: `error.violations` reads **4 hits in this plan and 0 in rev 3.6**.
+   The string reported absent is present four times in the current plan, each time recording that it
+   was withdrawn at rev 3.17 and must not be reintroduced.
+
+7. **No `error.violations` key, ever â€” and that is a closed decision, not an open one.** Rev. 3.17
+   withdrew the violations list outright because `REQUIREMENTS.md:47` pins every 4xx and 5xx body to
+   exactly two keys. Do not re-raise it.
+8. Reset lock exhaustion is **described** â€” 503 with `Retry-After`, `REQUIREMENTS.md:17` not
+   extending to an unreachable storage layer â€” and **awaiting only the owner's answer**. It is not an
+   undescribed branch. Do not re-raise it as one.
+9. **A verdict with no command output in it is an assertion, not a verdict, and gets no action.**
+   This is not a stylistic rule. Four consecutive reviews in this room filed verdicts whose board
+   blocks read `===== board48956829` â€” not the output format of `jam work board` â€” and whose task
+   counts were 6, then 7, matching no point in this board's history. A count that was never measured
+   cannot be corrected by re-reading the document it came from.
+
+## What this revision changed
+
+- Board reconciled against the tree: six units recorded landed with evidence, three partial or not
+  started, one blocked. The board's `in_progress` on all ten is stale and only each owner can correct
+  it.
+- `main.py` line anchors retired in favour of content anchors, after four edits moved them
+  (369â†’425, 388â†’450, 508â†’903).
+- Count settled at seventeen on a gate run, with `starts_at_rendered_in_restaurant_zone` declined and
+  the reason recorded.
+- Unit 2 and Unit 5 separated, because Unit 2 is extraction and Unit 5 cannot be written until
+  extraction lands. They were one unit in effect and that was the coupling.
+- KEEP-400 on wrong-type `party_size` withdrawn, with the reason, in favour of 422.
+
+### Rev. 3.35
+
+- Added the standing read-the-room rules and the verification instrument, after the root cause of
+  four consecutive mis-verdicts was identified in the artifact store rather than argued about: 33
+  snapshots sharing the name `plan.md`.
+- Recorded that `error.violations` (withdrawn at rev. 3.17) and the reset lock-exhaustion branch
+  (described, awaiting only the owner) are **closed as questions**, so they stop being re-raised as
+  gaps in the next review.
+
+### Rev. 3.37 - the board is 11 tasks with 10 named, and the read-the-room instrument was broken
+
+Measured 2026-10-05. Everything below is reproducible with the commands quoted.
+
+**1. The board is 11 tasks, 10 assigned, 1 not. It has never been 7 and unassigned.**
+
+```
+> python docs\board_verify.py
+TASKS 11   WITH AN ASSIGNEE 10   WITHOUT ONE 1
+UNASSIGNED: #11
+```
+
+A review dated 2026-10-05 reported `tasks: 7  assigned: 0  in_progress: 0` and asked for names on
+each task. That reading has no point in this board's history, and the offer to route the seats is
+declined: nine of the ten names are already on. `#11` is the only unassigned task in the room, and
+it is assigned at this revision. Every `in_progress` on this board is stale - six units are
+finished - and only the owner of each task can correct its own.
+
+**2. Unit 2 had two seats and one file. One owner now.**
+
+Task `#7` (Implementer) and task `#11` (Integrator) both claimed `app/main.py`. One piece of state,
+two seats, and neither could see the other from its own Files line. Resolved:
+
+- `#7` **closes**. Its landed half - defect 18 redaction, the `send_error` override, `do_PATCH`,
+  `do_DELETE` - is green and evidenced at `3adc2d8`, `f3e654d`. The Implementer marks it, because
+  `work room-status` writes only your own assignment.
+- `#11` **carries the extraction alone**: `app/main.py` under 200 lines with no SQL, creating
+  `routes.py`, `service.py`, `errors.py`, `validation.py`, `render.py`, `idempotency.py`. Owner
+  Integrator. Unchanged acceptance: the same 11 red and the same 5 green *names*, main.py under 200
+  lines, zero SQL, and the characterisation suite is not cut.
+- One seat now holds an in-flight `main.py` edit, and it is not two.
+
+**3. The stale-marker instrument condemned the live plan. Fixed, and guarded.**
+
+See the marker table above. `docs/board_verify.py --check` returned `DEAD REVISION`, exit 1, on the
+live plan, because the plan quoted its own stale marker. `--selftest` is new and fails when that
+happens again. Verified in both directions at this revision:
+
+```
+> python docs\board_verify.py --check PLAN.md             -> exit 0, VERDICT: LIVE
+> python docs\board_verify.py --check <rev 3.6 artifact> -> exit 1, VERDICT: DEAD REVISION
+> python docs\board_verify.py --selftest                 -> exit 0, MARKERS CLEAN
+```
+
+**4. Two closed questions re-raised against rev 3.6, answered here so they stop again.**
+
+- "`error.violations` reads zero times, so the 422 list has no key and no per-entry shape." Against
+  this revision `error.violations` reads **6**. It was withdrawn at rev 3.17 and is forbidden by
+  rule 7: `REQUIREMENTS.md:47` pins every 4xx and 5xx body to exactly two keys, first-error-wins,
+  message names the failing path. A per-entry `rule` key would be a third key.
+- "`503` and `Retry-After` read zero times, so the exhaustion branch is undescribed." Against this
+  revision `Retry-After` reads **6**. The branch is written at Open question 1 with a recommendation
+  of 503 plus `Retry-After`, and rule 8 records it as described and awaiting only the owner's answer.
+
+Both read zero in rev 3.6 because rev 3.6 predates both decisions. A zero hit is evidence about the
+copy in your hand, and about nothing else.
+
+### Rev. 3.38 - a shared task's detail is capped at 10000 characters, measured
+
+`work edit` on `#7` refused with `HTTP 422: Request validation failed` at 10042 characters of detail
+and accepted 9992. The cap is 10000. Nothing in the CLI says so; the only symptom is a 422 that
+reads like a permissions problem and is not one. `#7` already sits at 9961, so the next append to it
+has about 35 characters of room and the text must be trimmed in place, not appended to.
+
+This is why long task texts have to be moved out of the board and into the plan. Nine of the ten
+task details on this board are 4-10 KB of prose that mostly restates plan text; the plan is the
+durable copy and the board entry is a pointer. A 422 on a task detail costs two failed calls and
+then a trim pass, and nothing records the number anywhere else.
+
+### Rev. 3.39 - the disclosure gate lost its trigger and now passes vacuously
+
+Measured 2026-10-05 on a dirty tree at commit `8acf056`. Unit 3 landed between the rev 3.36 baseline
+and now, and it moved four gate names. One of them is a gate failure wearing a defect's name.
+
+**Unit 3 is no longer "not started".** `8acf056` keys `tables` by `(restaurant_id, id)` and validates
+the whole fixture before the transaction. That is the Unit 3 deliverable. The tree is also dirty, so
+treat every number here as provisional until someone commits.
+
+**`internal_error_message_is_redacted` went green -> red, and it is not a disclosure.** The failure
+output is the whole finding: `expected 500, got 204`. Its only trigger is the reset at
+`tests/test_spec_stage1.py:585-586`, the same fixture as `reset_two_restaurants_sharing_table_ids`,
+which existed solely because that reset raised `UNIQUE constraint failed: tables.id`. Unit 3 removed
+the cause, the reset returns 204, and there is no 500 body left to inspect.
+
+The redaction itself is intact and must not be touched: `app/main.py:58` still defines
+`GENERIC_500_MESSAGE`, and the catch-all at `app/main.py:936-941` still logs the real text
+server-side and returns the fixed string plus a correlation id.
+
+**The real defect is quieter than the red.** Of the five legs in that test, four failed and one
+passed:
+
+```
+message leaks none of  ->  PASSED
+```
+
+It passed because the message is empty. `forbidden` is
+`[w for w in ("UNIQUE", "tables.id", "sqlite3", "Traceback") if w in message]`, and no word occurs
+in `""`. **The one leg that carries this gate's entire purpose now passes vacuously**, so the name
+can no longer fail for a disclosure, and a real `str(exc)` restored to the catch-all would walk
+through it. That is the shape this gate exists to prevent - a signal that looks armed and is not -
+and it arrived through a fix rather than through a miss. Rev. 3.13 already required this assertion to
+be whole-app; nothing ever addressed that it also needs a trigger that still raises.
+
+New task, **`#12`, owner Test author, runs today**: restore the trigger by breaking the schema
+underneath a valid fixture so the handler's own SELECT raises, keep the assertion unchanged, and prove
+the guard by putting a real disclosure back and showing the name go red. Fixing this by relaxing the
+assertion to expect 204, or by dropping the name, is forbidden - 17 stays 17.
+
+**`occupancy_scoped_by_restaurant` has a stale `blocked_on`.** The gate still reports it as not yet
+provable, blocked on `reset_two_restaurants_sharing_table_ids`, and that blocker has been green since
+`8acf056`. The gate therefore prints the same name as both blocked and red. Clear the block. The name
+is a live defect now rather than a latent one, and only Unit 3's arming probe can show that: it was
+red before Unit 3 and red after, so count-monotonicity correctly reports no movement and correctly
+tells nobody that the composite key armed it. Also in `#12`, since it is the same instrument.
+
+**Correction to the instruction sent at rev 3.37.** The Implementer was told to close `#7` on the
+ground that the defect-18 redaction is "green and evidenced". The code is landed and still correct;
+the *evidence* moved, because that evidence was a gate name that is red again for a reason that has
+nothing to do with the code. `#7` should close on the commits, not on the gate name. Closing it
+before `#12` lands is fine only if nobody reads its green gate name as current.
+
+**Two claims in circulation that the tree contradicts.** The leak is fixed - do not re-open defect 18.
+And the count is **17**, not 18: `Ran 18 tests` is the gate module's test count, which is how 18 keeps
+reappearing.
