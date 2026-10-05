@@ -422,7 +422,7 @@ def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_
         (table_id, restaurant["id"]),
     ).fetchone()
     if table is None:
-        raise _invalid("no such table at this restaurant")
+        raise HttpError(404, "not_found", "no such table at this restaurant")
     if party_size < 1:
         raise _invalid("party_size must be at least 1")
     if table["capacity"] < party_size:

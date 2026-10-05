@@ -412,10 +412,20 @@ class Booking(unittest.TestCase):
                 headers={"Idempotency-Key": "wrong-type"})
             self.assertEqual((resp.status, resp.code), (400, "malformed_request"))
 
-    def test_an_unknown_table_is_a_validation_failure(self):
+    def test_an_unknown_table_is_not_found(self):
+        """A `table_id` that names no table at this restaurant is 404, not 422.
+
+        It was 422 `validation_failed` until the table lookup stopped being a field-shape check.
+        The distinction is §5's: 422 is for "a stated rule about a field is violated", and
+        `table_id: "t_nope"` violates no rule -- it is well-formed and simply names nothing. §5
+        assigns 404 `not_found` to a resource that does not exist, and every other lookup in the
+        service already answered that way (`no such restaurant`, `no such reservation`). This test
+        and the one-line product change it corrects moved in one commit on purpose: either alone,
+        one of them fails.
+        """
         with world() as w:
             resp = book(w, table_id="t_nope", key="no-table")
-            self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
+            self.assertEqual((resp.status, resp.code), (404, "not_found"))
 
 
 class Concurrency(unittest.TestCase):
