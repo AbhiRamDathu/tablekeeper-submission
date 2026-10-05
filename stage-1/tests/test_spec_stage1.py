@@ -83,6 +83,14 @@ NAMED_DEFECTS = (
 
 # A name the gate cannot honestly call red, because the thing that would fail first is not the
 # thing the name is about. Reported as not-yet-provable, never as an ordinary red entry.
+#
+# This dict declares what *may* be blocked and on what. It does not decide what *is* blocked --
+# `_report` reads the outcome of the run for that, and only a name that actually skipped is
+# reported here. The distinction matters, because a static report is wrong in both directions
+# without ever failing: it kept listing `occupancy_scoped_by_restaurant` as unprovable after its
+# blocker went green, and then again after the name itself went green, so a passing name was
+# permanently excluded from the green list and a real fix stayed invisible. `_report` now derives
+# the blocked set from `result.skipped`, which is the only evidence that a cause went unchecked.
 BLOCKED = {
     "occupancy_scoped_by_restaurant": "reset_two_restaurants_sharing_table_ids",
 }
@@ -441,16 +449,25 @@ class SpecGate(unittest.TestCase):
             assert_all(self, legs)
 
     def test_occupancy_scoped_by_restaurant(self):
-        """BLOCKED on `reset_two_restaurants_sharing_table_ids`.
+        """Runs in full. No longer blocked.
 
-        §8 requires `available_table_ids` to be "tables *of that restaurant*". This needs a world
-        with two restaurants, and a two-restaurant fixture sharing table ids 500s at reset on
-        `store.py`'s global PRIMARY KEY. A red entry here would claim a cause the runner never
-        checked: "red because occupancy is unscoped" and "red because reset 500s" are
-        indistinguishable in the output. So it is reported as not-yet-provable instead.
+        §8 requires `available_table_ids` to be "tables *of that restaurant*", and the name covers
+        both halves of that: what availability offers, and what can actually be booked.
 
-        The assertion is written out in full rather than left as a stub, so that fixing the
-        blocker turns this into a real red entry instead of a rewrite.
+        It was blocked on `reset_two_restaurants_sharing_table_ids`, because a two-restaurant
+        fixture sharing table ids used to 500 at reset on `store.py`'s global PRIMARY KEY, and
+        "red because occupancy is unscoped" was then indistinguishable from "red because reset
+        500s". Keying `tables` by `(restaurant_id, id)` removed that cause, and the assertion ran
+        for the first time -- and went red, because `_assert_slot_free` still read occupancy by
+        `table_id` alone. Keying the table made two restaurants able to own a `t_2` each, which is
+        exactly the world the unscoped query gets wrong; the latent defect became a live one.
+        `GET /availability` filtered by `restaurant_id`, so it *offered* `t_2` while the booking
+        answered 409 -- an offered table that could not be booked. Both are now scoped.
+
+        The `reset_shared_table_ids_is_fixed` guard stays, and it is what this docstring used to be
+        wrong about: it is a fallback, not the current state. If the composite key ever regresses
+        the test skips again, and `_report` will now say so, because it reads the skip rather than
+        assuming it.
         """
         blocked_on = BLOCKED["occupancy_scoped_by_restaurant"]
         if reset_shared_table_ids_is_fixed():
@@ -646,8 +663,15 @@ def _report(result) -> bool:
     """Print the gate report. Returns False when the subset property does not hold."""
     failing, unnamed = _gate_verdict(result)
     known_red = sorted(failing)
-    blocked = sorted(BLOCKED)
+    # Blocked is read off the run, not off `BLOCKED`: a name is unprovable only when its test
+    # actually skipped. Any named defect that skipped is reported here, not just the declared
+    # ones, so an unexpected skip is surfaced rather than quietly counted as green -- and
+    # `BLOCKED` still supplies the reason where one is on record.
+    skipped = {_defect_name_of(test.id()) for test, _ in list(result.skipped)
+               if _defect_name_of(test.id()) in NAMED_DEFECTS}
+    blocked = sorted(skipped)
     green = sorted(set(NAMED_DEFECTS) - failing - set(blocked))
+    reason = lambda name: BLOCKED.get(name, "skipped without a recorded blocker")
 
     lines = [
         "",
@@ -664,7 +688,7 @@ def _report(result) -> bool:
     ]
     lines += [f"  - {name}" for name in known_red] or ["  - (none)"]
     lines += ["", "NOT YET PROVABLE (never counted as red — the runner never checked the cause):"]
-    lines += [f"  - {name}\n      blocked_on: {BLOCKED[name]}" for name in blocked] or ["  - (none)"]
+    lines += [f"  - {name}\n      blocked_on: {reason(name)}" for name in blocked] or ["  - (none)"]
     lines += ["", "DECLINED (the plan proposed these; the spec does not support them):"]
     lines += [f"  - {name}\n      {DECLINED[name]}" for name in DECLINED] or ["  - (none)"]
 

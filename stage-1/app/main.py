@@ -445,11 +445,19 @@ def _assert_slot_free(conn, restaurant, table, starts, exclude_reference=None):
 
     `exclude_reference` drops the reservation being amended from the check, which would otherwise
     collide with itself.
+
+    The query is scoped to `restaurant_id` because `table_id` is only unique *within* a restaurant.
+    Keying `tables` by `(restaurant_id, id)` is what makes two restaurants able to own a `t_2`
+    each, and this is the query that has to follow from that: without the scope, a booking at one
+    restaurant occupies an identically-numbered table at every other restaurant. The symptom is
+    worse than a lost booking, because it contradicts the read path -- `GET /availability` filters
+    by `restaurant_id`, so it *offers* `t_2`, and the booking then answers 409. An offered table
+    that cannot be booked is the defect, and only one of the two paths was scoped.
     """
     ends = slot_end(starts, restaurant["reservation_duration_minutes"])
     clash = ("SELECT starts_at_utc FROM reservations"
-             " WHERE table_id = ? AND status != 'cancelled'")
-    params = [table["id"]]
+             " WHERE table_id = ? AND restaurant_id = ? AND status != 'cancelled'")
+    params = [table["id"], restaurant["id"]]
     if exclude_reference is not None:
         clash += " AND reference != ?"
         params.append(exclude_reference)
