@@ -469,31 +469,51 @@ def _widen_idempotency_for_path_scoping(conn: sqlite3.Connection) -> None:
     one thing SQLite cannot do with `ALTER TABLE`, so the table is rebuilt -- renamed aside, the
     current DDL reissued, the rows copied across, and only then the old table dropped.
 
-    The order is the point: **copy, then drop.** The receipts are copied before anything is
-    destroyed, so no failure between the two can lose one. And all four statements sit in one
-    `BEGIN IMMEDIATE`, so a process killed mid-migration rolls back to the old table intact and the
-    next start simply tries again -- there is no window in which `idempotency` does not exist.
+    Two orders are load-bearing, and only one of them was right at first.
+
+    **Copy, then drop.** The receipts are copied before anything is destroyed, so no failure between
+    the two can lose one.
+
+    **Read the shape inside the transaction, not before it.** The rebuild, the `PRAGMA table_info`
+    that decides whether it is needed, and the backfill constant derived from that read all happen
+    under the same `BEGIN IMMEDIATE`. Read the shape first and the decision is stale the moment it
+    is made: a second process starting on the same database reads "no `scope` column", blocks on
+    `BEGIN IMMEDIATE` until the first one commits, and then rebuilds the *already-migrated* table
+    with the backfill constant it chose before the lock -- rewriting every `POST /reservation-moves`
+    receipt to `POST /reservations`. The row survives, so nothing looks lost, but it can never be
+    found again on its own path: a replay of that batch becomes a first use, and §11:201's batch
+    applies a second time. Inside the transaction the second process reads the committed shape, sees
+    nothing to do, and leaves every scope alone.
+
+    The price is that `ensure_schema` now takes the write lock on every start, even on a database
+    already in the new shape. That is one uncontended `BEGIN`/`COMMIT` per process start against a
+    ten-second `busy_timeout`, which is cheaper than the receipt rewrite it prevents.
+
+    A process killed mid-migration still rolls back to the old table intact and the next start tries
+    again -- there is no window in which `idempotency` does not exist.
 
     Receipts are not derived state in the way the previous version of this function claimed. No
     domain row references them, true, but §7 makes a client depend on one directly: :86/:92 owe it
     the original response, and a key with no receipt is a first use, which for a create is a second
     booking. That is why nothing here drops a row.
     """
-    info = list(conn.execute("PRAGMA table_info(idempotency)"))
-    if not info:
-        return
-    columns = {row["name"] for row in info}
-    # `pk` is the 1-based position in the primary key, 0 for a plain column.
-    primary_key = [row["name"] for row in sorted(info, key=lambda row: row["pk"]) if row["pk"]]
-    if "scope" in columns and primary_key == ["key", "user_id", "scope"]:
-        return
-
-    # A table that already has `scope` keeps whatever it says; one that does not is backfilled,
-    # because a receipt whose scope cannot be recovered is a receipt that will never replay.
-    scope_source = "scope" if "scope" in columns else "?"
-    params = () if "scope" in columns else (_PRE_SCOPE_RESERVATIONS_SCOPE,)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        info = list(conn.execute("PRAGMA table_info(idempotency)"))
+        if not info:
+            conn.execute("COMMIT")
+            return
+        columns = {row["name"] for row in info}
+        # `pk` is the 1-based position in the primary key, 0 for a plain column.
+        primary_key = [row["name"] for row in sorted(info, key=lambda row: row["pk"]) if row["pk"]]
+        if "scope" in columns and primary_key == ["key", "user_id", "scope"]:
+            conn.execute("COMMIT")
+            return
+
+        # A table that already has `scope` keeps whatever it says; one that does not is backfilled,
+        # because a receipt whose scope cannot be recovered is a receipt that will never replay.
+        scope_source = "scope" if "scope" in columns else "?"
+        params = () if "scope" in columns else (_PRE_SCOPE_RESERVATIONS_SCOPE,)
         conn.execute("ALTER TABLE idempotency RENAME TO idempotency__pre_scope")
         conn.execute(IDEMPOTENCY_DDL)
         conn.execute(

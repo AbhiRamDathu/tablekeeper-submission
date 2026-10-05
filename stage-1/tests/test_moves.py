@@ -1274,6 +1274,26 @@ class UpgradeKeepsReceipts(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.db = pathlib.Path(tmp.name) / "upgrade.sqlite"
 
+    def use_this_database(self):
+        """Point `TABLEKEEPER_DB` at this class's throwaway file for the rest of the test.
+
+        `store.connect()` resolves the path from the environment *at call time*, and `server_on`
+        puts the previous value back on exit -- so outside that context manager a bare
+        `store.connect()` opens the repository's own `tablekeeper.sqlite` instead. That is a
+        different file, and a test written this way migrates it and asserts about it without ever
+        touching the database it set up.
+        """
+        previous = os.environ.get("TABLEKEEPER_DB")
+        os.environ["TABLEKEEPER_DB"] = str(self.db)
+
+        def restore():
+            if previous is None:
+                os.environ.pop("TABLEKEEPER_DB", None)
+            else:
+                os.environ["TABLEKEEPER_DB"] = previous
+
+        self.addCleanup(restore)
+
     def rewind_receipts(self):
         """Put `idempotency` back into its pre-moves shape, carrying every row across intact."""
         conn = sqlite3.connect(self.db)
@@ -1486,6 +1506,129 @@ class UpgradeKeepsReceipts(unittest.TestCase):
         with server_on(self.db):
             pass
         self.assertEqual(self.receipts(), before)
+
+    def test_the_shape_is_read_inside_the_write_lock(self):
+        """The decision that drives the rebuild is made under the same lock the rebuild takes.
+
+        Ordering, not outcome: a migration can produce the right table and still be racy, and the
+        difference shows only when a second process is mid-migration. So the order of the statements
+        is asserted directly, which `sqlite3`'s trace callback makes possible without putting a hook
+        in `store.py`. Two processes starting on one database is the shape the bug needs, and it is
+        the shape a rolling restart or two replicas on a shared volume actually produce.
+
+        Stated as its limit, because a reader should know: this test cannot observe a wrong *value*
+        being written, only that the read which decides the value happens under the lock. The
+        behaviour is the next test's job.
+        """
+        from app import store
+
+        self.book_under_a_key_before_the_upgrade()
+        self.rewind_receipts()
+        self.use_this_database()
+
+        conn = store.connect()
+        self.addCleanup(conn.close)
+        traced = []
+        conn.set_trace_callback(traced.append)
+        try:
+            store._widen_idempotency_for_path_scoping(conn)
+        finally:
+            conn.set_trace_callback(None)
+
+        begin = next((i for i, s in enumerate(traced)
+                      if s.strip().upper().startswith("BEGIN")), None)
+        shape = next((i for i, s in enumerate(traced) if "idempotency" in s.lower()), None)
+        self.assertIsNotNone(begin, f"no transaction was opened: {traced}")
+        self.assertIsNotNone(shape, f"the table's shape was never read: {traced}")
+        self.assertLess(begin, shape,
+                        f"the shape was read before the write lock was taken, so the decision to "
+                        f"rebuild and the constant used to rebuild it can both be stale by the time "
+                        f"the lock is held: {traced}")
+
+    def test_a_migrator_that_waits_for_the_lock_does_not_rewrite_a_later_scope(self):
+        """The race itself, driven to a known interleaving rather than hoped for.
+
+        Three processes' worth of state, in this order:
+
+        1. a pre-moves database holding one create receipt;
+        2. a holder that owns the write lock, and a second migrator that reaches `BEGIN IMMEDIATE`
+           and blocks on it -- the trace callback is what makes "has reached it" observable instead
+           of a sleep;
+        3. while that migrator waits, the holder finishes the migration itself and takes a *batch*
+           receipt, then commits.
+
+        The waiting migrator now runs with a decision made before the lock. Read outside the
+        transaction it rebuilds the finished table and stamps the backfill constant over the batch
+        receipt's own scope, which no longer exists for that path anywhere -- so a replay of that
+        batch reads as a first use and §11:201's batch runs a second time. Read inside the
+        transaction it sees the committed shape, does nothing, and every scope survives.
+
+        This is the assertion that fails on the version of the migration that read `table_info`
+        before `BEGIN IMMEDIATE`, and the ordering test above is what keeps it from coming back.
+        """
+        from app import store
+
+        self.book_under_a_key_before_the_upgrade()
+        self.assertEqual(self.rewind_receipts(), 1)
+        self.use_this_database()
+
+        holder = store.connect()
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+
+        reached_begin = threading.Event()
+        outcome = []
+
+        def migrator():
+            # The connection is opened here, not in the test thread: `store.connect` leaves
+            # sqlite3's `check_same_thread` on, and using a connection from another thread would
+            # raise rather than test anything.
+            conn = store.connect()
+            try:
+                def trace(statement):
+                    if statement.strip().upper().startswith("BEGIN"):
+                        reached_begin.set()
+                conn.set_trace_callback(trace)
+                store._widen_idempotency_for_path_scoping(conn)
+            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+                outcome.append(exc)
+            finally:
+                conn.set_trace_callback(None)
+                conn.close()
+
+        worker = threading.Thread(target=migrator, daemon=True)
+        worker.start()
+        self.assertTrue(reached_begin.wait(30),
+                        "the second migrator never reached BEGIN IMMEDIATE, so it never waited")
+
+        # The other process finishes the job, and then takes a batch receipt on the new shape.
+        holder.execute("ALTER TABLE idempotency RENAME TO idempotency__pre_scope")
+        holder.execute(store.IDEMPOTENCY_DDL)
+        holder.execute(
+            "INSERT INTO idempotency (key, user_id, scope, request_hash, status_code, response_body)"
+            " SELECT key, user_id, ?, request_hash, status_code, response_body"
+            " FROM idempotency__pre_scope", (store._PRE_SCOPE_RESERVATIONS_SCOPE,))
+        holder.execute("DROP TABLE idempotency__pre_scope")
+        holder.execute(
+            "INSERT INTO idempotency (key, user_id, scope, request_hash, status_code, response_body)"
+            " VALUES ('k-moves', 'u_ada', 'POST /reservation-moves', 'hash-moves', 201, '{}')")
+        holder.execute("COMMIT")
+
+        worker.join(timeout=30)
+        self.assertFalse(worker.is_alive(), "the waiting migrator never finished")
+        self.assertEqual(outcome, [], f"the migrator raised instead of doing nothing: {outcome!r}")
+
+        # The load-bearing assertion: the batch receipt keeps the only scope that has ever existed
+        # for POST /reservation-moves. A migrator that rebuilt the finished table stamps the
+        # backfill constant over it, the row survives, and nothing looks lost.
+        self.assertEqual(
+            [(row["key"], row["scope"]) for row in self.receipts()],
+            [("k-across-upgrade", store._PRE_SCOPE_RESERVATIONS_SCOPE),
+             ("k-moves", "POST /reservation-moves")],
+            "a scope was rewritten over a receipt the waiting migrator had already decided to "
+            "backfill; the batch receipt can then never be found on its own path")
+        self.assertEqual(self.receipt_count(), 2)
+        self.assertEqual(self.primary_key(), ["key", "user_id", "scope"])
 
 
 class BatchReceiptsSurviveExportImport(unittest.TestCase):
