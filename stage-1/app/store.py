@@ -90,11 +90,46 @@ CREATE TABLE IF NOT EXISTS tables (
 );
 """
 
-#: Applied after the ordinal migration, never before: `tables_by_ordinal` indexes a column that a
+# `ordinal` is the same contract as `tables.ordinal`, for the same phrase of the specification:
+# §8:101 returns `opening_hours` and `tables` "in the fixture's shape", and the room reads that as
+# fixture *order* -- `opening_hours_in_fixture_order` and `table_ids_are_returned_in_fixture_order`
+# are two named defects off one clause. Reading it for `tables` and not for `opening_hours` would be
+# an arbitrary line, and the shipped red test for the second one exists precisely to say so.
+#
+# The justification is not "rowid might renumber". Measured on this host, SQLite 3.40.1 did *not*
+# renumber rowids across a VACUUM for either shape, so that argument, though it is what SQLite
+# documents, did not reproduce and is not what this column is for. The measured reason is stronger
+# and simpler: with no `ORDER BY` at all, the returned order is *insertion sequence*, which equals
+# fixture order only while every writer happens to insert in array order. Deleting one row and
+# inserting it again moves it to the end for good, with or without a VACUUM, and `POST /_test/import`
+# (§10) is a second writer that does not exist yet and would have to get this right by accident. A
+# column written at insert is a contract; a rowid is a side effect.
+OPENING_HOURS_DDL = """
+CREATE TABLE IF NOT EXISTS opening_hours (
+    restaurant_id TEXT NOT NULL REFERENCES restaurants(id),
+    weekday       TEXT NOT NULL,
+    opens         TEXT NOT NULL,
+    closes        TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+#: Applied after the ordinal migrations, never before: both indexes name a column that a
 #: pre-ordinal database does not have. See `ensure_schema`.
+#:
+#: `tables_by_ordinal` is UNIQUE and `opening_hours_by_ordinal` deliberately is not, and the
+#: difference is not an oversight. `tables` is keyed `(restaurant_id, id)`, so two rows of one
+#: restaurant cannot be identical and every position among them is unambiguous -- a unique index can
+#: only ever be satisfied. `opening_hours` has **no primary key at all**, so a byte-identical
+#: duplicate row is representable, and a unique index would make `ensure_schema` raise `IntegrityError`
+#: on start for such a database: turning a harmless duplicate into a service that will not boot.
+#: Two indistinguishable rows sharing one ordinal is unobservable in a response, because they render
+#: identically -- so the looser constraint costs nothing and refuses nothing.
 SCHEMA_INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS tables_by_ordinal
     ON tables(restaurant_id, ordinal);
+CREATE INDEX IF NOT EXISTS opening_hours_by_ordinal
+    ON opening_hours(restaurant_id, ordinal);
 """
 
 SCHEMA_TABLES = """
@@ -116,13 +151,7 @@ CREATE TABLE IF NOT EXISTS restaurants (
     reservation_duration_minutes INTEGER NOT NULL,
     cancellation_cutoff_minutes  INTEGER NOT NULL
 );
-""" + TABLES_DDL + """
-CREATE TABLE IF NOT EXISTS opening_hours (
-    restaurant_id TEXT NOT NULL REFERENCES restaurants(id),
-    weekday       TEXT NOT NULL,
-    opens         TEXT NOT NULL,
-    closes        TEXT NOT NULL
-);
+""" + TABLES_DDL + OPENING_HOURS_DDL + """
 CREATE TABLE IF NOT EXISTS reservations (
     reference       TEXT PRIMARY KEY,
     restaurant_id   TEXT NOT NULL,
@@ -487,11 +516,12 @@ def reset_database(fixture: dict) -> None:
                  restaurant["slot_minutes"], restaurant["reservation_duration_minutes"],
                  restaurant["cancellation_cutoff_minutes"]),
             )
-            for hours in restaurant.get("opening_hours", []):
+            for hours_ordinal, hours in enumerate(restaurant.get("opening_hours", [])):
                 conn.execute(
-                    "INSERT INTO opening_hours (restaurant_id, weekday, opens, closes)"
-                    " VALUES (?, ?, ?, ?)",
-                    (restaurant["id"], hours["weekday"], hours["opens"], hours["closes"]),
+                    "INSERT INTO opening_hours (restaurant_id, weekday, opens, closes, ordinal)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (restaurant["id"], hours["weekday"], hours["opens"], hours["closes"],
+                     hours_ordinal),
                 )
             for table_ordinal, table in enumerate(restaurant.get("tables", [])):
                 conn.execute(
@@ -534,6 +564,7 @@ def ensure_schema() -> None:
         _widen_tables_key_to_the_restaurant(conn)
         _widen_idempotency_for_path_scoping(conn)
         _add_table_fixture_ordinals(conn)
+        _add_opening_hours_fixture_ordinals(conn)
         conn.executescript(SCHEMA_INDEXES)
     finally:
         conn.close()
@@ -601,12 +632,26 @@ def _add_table_fixture_ordinals(conn: sqlite3.Connection) -> None:
     `NOT NULL DEFAULT 0`, which SQLite permits on a table that already has rows, so unlike the
     primary-key widenings above this needs no rebuild and cannot lose a row.
 
-    **Only `tables`.** `restaurants` deliberately keeps its shape. §8:99 specifies the restaurant
-    list's envelope and its three fields and says nothing about order, unlike §8:112; adding a
-    column for an order nothing requires would also break every positional
-    `INSERT INTO restaurants VALUES (...)` in the suite for no gain. If restaurant order is ever
-    wanted it is one column and one migration, and it should be argued for on the specification
-    rather than smuggled in beside a requirement that does need it.
+    **Only `tables`, and `opening_hours` is the twin -- but `restaurants` is not.** §8:112 asks for
+    `available_table_ids` "in fixture order" in as many words and §8:101 returns `tables` and
+    `opening_hours` "in the fixture's shape", which this repository reads as order and has two named
+    red defects for. §8:99 asks for something else: `GET /restaurants` is pinned to
+    `{"restaurants":[{id,name,timezone}]}` and **nothing else**. No order, no "fixture's shape".
+
+    That is not only an absence in the prose, and the measurement is worth keeping because the
+    argument has been made twice in this room on citation alone. The shipped
+    `test_restaurants_list_envelope` has four legs -- envelope shape, two seeded restaurants listed,
+    every entry carrying `id`/`name`/`timezone` -- and **not one of them mentions order**. The name is
+    red for the envelope: the handler returns a bare list. Alphabetising it is therefore not a defect
+    this suite can fail and not a requirement the specification makes.
+
+    The cost is also concrete rather than theoretical: `tests/test_store_schema.py:156` writes
+    `INSERT INTO restaurants VALUES ('r_one','One','Europe/Berlin',30,90,120)` positionally against
+    six columns. A seventh column makes that raise `table restaurants has 7 columns but 6 values were
+    supplied`, so the column would break a shipped test on the way in.
+
+    If restaurant order is ever wanted it is one column and one migration, and it should be argued for
+    on the specification rather than smuggled in beside a requirement that does need it.
 
     **The backfill is deterministic but it is not the truth, and that is fine.** A row's real ordinal
     lived only in the JSON array that produced it, and that array is gone -- so for a database
@@ -647,6 +692,64 @@ def _add_table_fixture_ordinals(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "UPDATE tables SET ordinal = ? WHERE restaurant_id = ? AND id = ?",
                     (position, group, identifier),
+                )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _add_opening_hours_fixture_ordinals(conn: sqlite3.Connection) -> None:
+    """Give `opening_hours` an `ordinal` recording its position in its restaurant's fixture array.
+
+    The twin of `_add_table_fixture_ordinals`, and it exists for the same reason: §8:101 returns
+    `opening_hours` "in the fixture's shape", `ORDER BY weekday` answers a different question --
+    alphabetical -- and on a fixture written `sat, mon, fri` the two disagree, which is exactly the
+    shipped `opening_hours_in_fixture_order`. `ALTER TABLE ... ADD COLUMN` is enough, because the
+    column is `NOT NULL DEFAULT 0` and SQLite permits that on a table that already has rows: no
+    rebuild, and so no way to lose one.
+
+    **The backfill is ordered by content, not by rowid.** `(restaurant_id, weekday, opens, closes)`
+    gives the same answer for the same logical rows on every machine and in every file. Ordering by
+    `rowid` would tie-break identically-identical rows by insertion accident, which is the property
+    this column exists to stop depending on.
+
+    **Two byte-identical rows are the one case the backfill cannot separate**, and it is left
+    standing rather than repaired: they receive one shared ordinal, which is why
+    `opening_hours_by_ordinal` is a plain index. Deduplicating would silently delete configuration a
+    fixture asked for, and §10:172 requires import to preserve fixture configuration rather than
+    renormalise it. The rows render identically, so nothing observable depends on which comes first.
+
+    **The backfill is deterministic but it is not the truth, and that is fine** -- the same argument
+    as `_add_table_fixture_ordinals`, and it rests on the same measured fact: `reset_database` deletes
+    every row of all seven tables and rewrites them from the fixture in array order, so these rows
+    exist *only* as a product of a reset. A pre-ordinal database is one written by an older binary and
+    never reset since, and the first reset converges it to true fixture order, so no API can observe
+    the backfilled values. Stable is the whole requirement; faithful is unavailable.
+
+    **The shape is read inside the write lock**, for the same reason as the two migrations above it:
+    a decision made outside `BEGIN IMMEDIATE` is stale by the time the lock is granted.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        info = list(conn.execute("PRAGMA table_info(opening_hours)"))
+        if info and "ordinal" not in {row["name"] for row in info}:
+            conn.execute("ALTER TABLE opening_hours ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0")
+            # Assigned in Python rather than with `ROW_NUMBER() OVER (...)`: SQLite rejects a window
+            # function directly in an UPDATE's SET, and this keeps the file dependent on nothing newer
+            # than a plain cursor for a fixture-sized table.
+            seen: dict[str, int] = {}
+            for row in conn.execute(
+                    "SELECT restaurant_id, weekday, opens, closes FROM opening_hours"
+                    " ORDER BY restaurant_id, weekday, opens, closes"
+            ):
+                group = row["restaurant_id"]
+                position = seen.get(group, 0)
+                seen[group] = position + 1
+                conn.execute(
+                    "UPDATE opening_hours SET ordinal = ?"
+                    " WHERE restaurant_id = ? AND weekday = ? AND opens = ? AND closes = ?",
+                    (position, row["restaurant_id"], row["weekday"], row["opens"], row["closes"]),
                 )
         conn.execute("COMMIT")
     except BaseException:
