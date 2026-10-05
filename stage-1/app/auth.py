@@ -20,7 +20,22 @@ __all__ = ["hash_password", "verify_password", "issue_token", "signup", "authent
            "ValidationFailure", "MalformedRequest", "CredentialsTaken", "BadCredentials"]
 
 _PBKDF2_ROUNDS = 120_000
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# `\Z`, not `$`, and the difference is one accepted signup.
+#
+# In Python `$` matches at the end of the string *or just before a newline at the end of it*, so
+# `ada@example.com\n` passed this pattern and became a stored account whose address carries a
+# trailing line feed. `\Z` matches the absolute end and nothing else. Measured over 21 cases, this
+# character changes exactly one verdict -- `ada@example.com\n` from accepted to refused -- and leaves
+# the other twenty alone, so it closes the hole without moving anything else.
+#
+# The literal `\.` is a separate decision and is deliberately still here. `:68` says an email must be
+# "of the form `local@domain`", which reads either as one `@` between two non-empty parts or as the
+# conventional dotted domain; no shipped test decides it, because every address in the suite is
+# `*@example.com` or `a@b.co`. Dropping the dot would accept `x@y`, `a@b` and `ada@localhost`, and
+# that is a spec question for the owner rather than a bug fix -- so if it is ever relaxed it is a
+# deliberate commit, not a quiet edit to this line.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+\Z")
 MIN_PASSWORD_LENGTH = 8
 
 
