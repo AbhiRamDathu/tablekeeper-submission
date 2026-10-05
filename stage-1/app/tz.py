@@ -59,7 +59,12 @@ def parse_local(value: object) -> dt.datetime:
     try:
         return dt.datetime(year, month, day, hour, minute)
     except ValueError as exc:
-        raise InvalidLocalTime(str(exc)) from exc
+        # `datetime` words this as "day is out of range for month" / "month must be in 1..12", which
+        # names the offending component and no more -- but it is the one message on this path that
+        # is not written here. Reached by `2026-02-30`, which matches `_LOCAL_RE` and so survives
+        # every check above. Authored instead of forwarded, so nothing on the client side of this
+        # boundary is ever stdlib text; the real message is one `from exc` away in the log.
+        raise InvalidLocalTime(f"starts_at_local names a date that does not exist: {value}") from exc
 
 
 def _round_trips(naive: dt.datetime, tz: ZoneInfo) -> bool:

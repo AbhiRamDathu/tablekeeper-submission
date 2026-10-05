@@ -39,8 +39,13 @@ from .tz import (  # noqa: E402
 )
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_POSITIVE_INT_RE = re.compile(r"^\d+$")
+# `[0-9]`, not `\d`: in Python's `re` `\d` matches every Unicode decimal digit, so `^\d+$` also
+# accepts `٤` and `４`, and `int()` then parses them happily. `REQUIREMENTS.md:59` says an integer
+# query parameter is *plain decimal digits*, and a fullwidth four is not one. `date` is defended
+# twice over because `date.fromisoformat` rejects what the regex lets through; `party_size` had no
+# second line of defence.
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_POSITIVE_INT_RE = re.compile(r"^[0-9]+$")
 _REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 #: §11:186 bounds a batch at 1-8 move objects. Zero is out of range too, which is why an empty
@@ -56,6 +61,13 @@ log = logging.getLogger(__name__)
 # enough. The detail goes to the server log instead; the correlation id is what lets an operator
 # join the two.
 GENERIC_500_MESSAGE = "an internal error occurred"
+
+# Every body this service writes is UTF-8, and the spec asks for that to be visible rather than
+# assumed: bare `application/json` used to go out on both response paths, which is legal HTTP but is
+# not the `application/json; charset=utf-8` the runtime contract names. One constant, because
+# `_respond` and the `send_error` override are the only two places that write the header and a
+# header that is correct on one path and not the other is the kind of split nothing else catches.
+JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
 # `BaseHTTPRequestHandler.send_error` speaks its own dialect: an HTML page. The spec says every 4xx
 # and 5xx body is `{"error":{"code":...,"message":...}}`, and the errors it raises are exactly the
@@ -86,6 +98,73 @@ def _new_correlation_id() -> str:
     return secrets.token_hex(8)
 
 
+#: The one sentence a client gets when the exception reaching it carries text this module did not
+#: author. Keyed by status, so the fallback is still specific about what went wrong -- a caller can
+#: retry a 503 and must not retry a 422 -- while interpolating nothing at all.
+GENERIC_ERROR_MESSAGES = {
+    400: "the request could not be understood",
+    401: "the supplied credentials were not accepted",
+    404: "no such resource",
+    409: "that resource already exists",
+    422: "the request failed validation",
+    500: GENERIC_500_MESSAGE,
+}
+
+#: The exception types whose message text this service wrote on purpose, and is therefore safe to
+#: forward. This is an **allowlist**, not a denylist of bad types, and the direction is the whole
+#: point: a new exception type is withheld from clients until someone decides its text is
+#: publishable, so adding a catch clause somewhere cannot silently start leaking internals.
+#:
+#: Each of these is raised with a literal or with a path we built (`auth.py` and `store.py` construct
+#: every one of them from their own strings), which is the property that earns the entry. What is
+#: deliberately absent: anything out of `sqlite3`, and anything out of the standard library.
+_AUTHORED_MESSAGES = (
+    auth.MalformedRequest,
+    auth.ValidationFailure,
+    auth.CredentialsTaken,
+    auth.BadCredentials,
+    store.InvalidFixture,
+    InvalidLocalTime,
+    NonExistentLocalTime,
+)
+
+
+def client_message(exc: str | BaseException, status: int) -> str:
+    """The text a client may see for `exc`, which is not always `str(exc)`.
+
+    Takes a literal as readily as an exception, because most call sites pass a string this module
+    wrote -- a string is forwarded unchanged, and only an *exception* has to earn the right to have
+    its text published. That keeps the whole surface in one place without making every fixed message
+    an f-string.
+
+    Eight sites raise a caught exception's own message to the wire. Each is currently safe, because
+    every one of those exceptions is constructed from a string this service wrote -- `auth.py:100`
+    raises `CredentialsTaken(email)` with the *address*, not with the `sqlite3.IntegrityError` that
+    provoked it, so a failed signup answers `409` with the caller's own address and nothing else.
+    Verified by forcing a real `IntegrityError` inside the signup transaction: the body was
+    `{"code": "email_taken", "message": "x@y.co"}`, with no `UNIQUE`, no `users.email`, no traceback.
+
+    So the disclosure these sites could cause is a *latent* one, not a live one, and that is exactly
+    why it is worth closing centrally. The dangerous shape is not any single line; it is
+    `except SomeError as exc: raise _invalid(str(exc))` appearing a ninth time after someone adds a
+    `sqlite3` failure to a new path. Patching each site freezes today's safe arrangement and says
+    nothing about tomorrow's.
+
+    Hence the allowlist above. Authored text is forwarded, because a client that cannot be told
+    *which* field it got wrong cannot fix it -- and `REQUIREMENTS.md:169` wants the failing path in
+    the 422 for exactly this reason, so flattening all of these to one generic string would trade a
+    real requirement for a fix to nothing. Anything not on the list gets a fixed sentence chosen by
+    status, which discloses nothing and cannot leak a table name.
+    """
+    if isinstance(exc, str):
+        return exc
+    if isinstance(exc, _AUTHORED_MESSAGES):
+        return str(exc)
+    log.warning("withholding unrecognised %s text from a %s client response",
+                type(exc).__name__, status)
+    return GENERIC_ERROR_MESSAGES.get(status, GENERIC_500_MESSAGE)
+
+
 class HttpError(Exception):
     """An error with the status and `error.code` the spec assigns it."""
 
@@ -96,12 +175,12 @@ class HttpError(Exception):
         self.message = message
 
 
-def _malformed(message: str) -> HttpError:
-    return HttpError(400, "malformed_request", message)
+def _malformed(message: str | BaseException) -> HttpError:
+    return HttpError(400, "malformed_request", client_message(message, 400))
 
 
-def _invalid(message: str) -> HttpError:
-    return HttpError(422, "validation_failed", message)
+def _invalid(message: str | BaseException) -> HttpError:
+    return HttpError(422, "validation_failed", client_message(message, 422))
 
 
 # ---- handlers -------------------------------------------------------------
@@ -114,7 +193,14 @@ def reset(request, match):
     body = request.json_body()
     if not isinstance(body, dict):
         raise _malformed("fixture must be a JSON object")
-    store.reset_database(body)
+    try:
+        store.reset_database(body)
+    except store.InvalidFixture as exc:
+        # `store` raises this with the fixture path and the first failing rule already spelled out,
+        # and `REQUIREMENTS.md:169` wants exactly that sentence as a 422. Letting it reach the
+        # catch-all in `_dispatch` turned every invalid fixture into a 500, which `REQUIREMENTS.md:17`
+        # forbids outright. The validation runs before the transaction opens, so nothing was written.
+        raise _invalid(exc) from exc
     return 204, None
 
 
@@ -123,11 +209,11 @@ def post_signup(request, match):
     try:
         created = auth.signup(request.json_body(), user_id)
     except auth.MalformedRequest as exc:
-        raise _malformed(str(exc)) from exc
+        raise _malformed(exc) from exc
     except auth.ValidationFailure as exc:
-        raise _invalid(str(exc)) from exc
+        raise _invalid(exc) from exc
     except auth.CredentialsTaken as exc:
-        raise HttpError(409, "email_taken", str(exc)) from exc
+        raise HttpError(409, "email_taken", client_message(exc, 409)) from exc
     return 201, created
 
 
@@ -135,9 +221,9 @@ def post_login(request, match):
     try:
         return 200, auth.authenticate(request.json_body())
     except auth.MalformedRequest as exc:
-        raise _malformed(str(exc)) from exc
+        raise _malformed(exc) from exc
     except auth.BadCredentials as exc:
-        raise HttpError(401, "unauthenticated", str(exc)) from exc
+        raise HttpError(401, "unauthenticated", client_message(exc, 401)) from exc
 
 
 def list_restaurants(request, match):
@@ -296,28 +382,6 @@ def list_reservations(request, match):
     return 200, [_reservation_body(row) for row in rows]
 
 
-def post_reservation(request, match):
-    user = request.require_user()
-    key = request.headers.get("Idempotency-Key")
-    if key is None or key == "":
-        raise HttpError(400, "missing_idempotency_key", "Idempotency-Key is required")
-    if not 1 <= len(key) <= 255:
-        raise _invalid("Idempotency-Key must be 1..255 characters")
-
-    body = request.json_body()
-    if not isinstance(body, dict):
-        raise _malformed("request body must be a JSON object")
-    for field in ("restaurant_id", "table_id", "starts_at_local"):
-        if not isinstance(body.get(field), str):
-            raise _malformed(f"{field} must be a string")
-    if not isinstance(body.get("party_size"), int) or isinstance(body.get("party_size"), bool):
-        raise _malformed("party_size must be an integer")
-
-    request_hash = hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
 def get_reservation(request, match):
     request.require_user()
     conn = store.connect()
@@ -431,12 +495,12 @@ def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_
     try:
         naive = parse_local(starts_at_local)
     except InvalidLocalTime as exc:
-        raise _invalid(str(exc)) from exc
+        raise _invalid(exc) from exc
     zone = ZoneInfo(restaurant["timezone"])
     try:
         starts = resolve(naive, zone)
     except NonExistentLocalTime as exc:
-        raise _invalid(str(exc)) from exc
+        raise _invalid(exc) from exc
     return table, starts
 
 
@@ -955,7 +1019,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.dumps(body).encode("utf-8")
         self.send_response(status)
         if payload:
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", JSON_CONTENT_TYPE)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         if payload:
@@ -994,7 +1058,7 @@ class Handler(BaseHTTPRequestHandler):
         if code >= 200 and code not in (204, 205, 304):
             body = json.dumps({"error": {"code": _framework_error_code(code),
                                          "message": shortmsg}}).encode("utf-8")
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", JSON_CONTENT_TYPE)
             self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 

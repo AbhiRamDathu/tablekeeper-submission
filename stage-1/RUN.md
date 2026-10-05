@@ -44,6 +44,12 @@ python -m unittest discover -s tests -t . -v
 No test framework beyond the standard library is needed. A run reporting `Ran 0 tests` is not
 a pass; check the count.
 
+`tests/test_spec_stage1.py` and `tests/test_spec_stage2.py` are spec gates. Each failing test is one
+*named* defect, and the run ends with a `SPEC GATE` report listing red, green and not-yet-provable
+names. That report is the thing to read, not the failure count: a failing test whose name is not in
+the named list means the tree and the specification have diverged somewhere nobody wrote down, and the
+gate fails the run over it.
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
@@ -51,13 +57,26 @@ a pass; check the count.
 | GET | `/health` | no | liveness |
 | GET | `/restaurants` | no | fixture restaurants |
 | GET | `/restaurants/{id}` | no | one restaurant, with tables |
-| GET | `/restaurants/{id}/availability` | no | slots for `date` and `party_size` |
+| GET | `/availability?restaurant_id=&date=&party_size=` | no | slots; all three params required |
 | POST | `/auth/signup` | no | create an account, returns a token |
 | POST | `/auth/login` | no | exchange credentials for a token |
 | GET | `/reservations` | bearer | the caller's reservations |
 | GET | `/reservations/{reference}` | bearer | one reservation |
 | POST | `/reservations` | bearer | book; requires `Idempotency-Key` |
+| PATCH | `/reservations/{reference}` | bearer | amend table, time or party; no key needed |
+| POST | `/reservations/{reference}/cancel` | bearer | cancel; 200 even if already cancelled |
+| POST | `/reservation-moves` | bearer | amend 1–8 bookings atomically; requires `Idempotency-Key` |
 | POST | `/_test/reset` | no | replace the fixture |
+
+`Idempotency-Key` is required on exactly two paths: `POST /reservations` and `POST /reservation-moves`.
+A first use answers 201; a replay of the same user, method, path and body answers 200 with the original
+body; the same key with a different body answers 409 `idempotency_key_reuse`.
 
 Errors are always `{"error": {"code": ..., "message": ...}}`. Authentication is
 `Authorization: Bearer <token>`.
+
+## Not implemented
+
+`GET /_test/export` and `POST /_test/import` — the whole of REQUIREMENTS.md §10 — answer
+`404 not_found`. No route is registered for either. They are listed here so the gap is visible in
+the documentation rather than discovered by a caller.

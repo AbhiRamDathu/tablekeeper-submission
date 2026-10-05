@@ -79,6 +79,16 @@ NAMED_DEFECTS = (
     "opening_hours_in_fixture_order",
     "slot_end_is_absolute_across_transitions",
     "internal_error_message_is_redacted",
+    # Stage 2. The names live here, next to the gate that reads them, and their test methods live in
+    # `tests/test_spec_stage2.py` -- a second tuple that could drift is a second source of truth, and
+    # `test_spec_stage2.NamedDefectsHaveTests` fails the run if the two ever disagree. SS10's two
+    # names are red for one cause: both routes are absent, so the count moves by two when they land.
+    "export_and_import_are_served",
+    "import_is_replacement_and_preserves_receipts",
+    "import_rejects_a_bad_envelope_without_changing_the_destination",
+    "table_ids_are_returned_in_fixture_order",
+    "json_responses_declare_utf8",
+    "non_ascii_digits_are_not_decimal_digits",
 )
 
 # A name the gate cannot honestly call red, because the thing that would fail first is not the

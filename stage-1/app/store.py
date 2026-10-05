@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from .tz import parse_local, resolve
 
-__all__ = ["database_path", "connect", "transaction", "reset_database", "SCHEMA",
+__all__ = ["database_path", "connect", "transaction", "reset_database", "SCHEMA_TABLES",
            "InvalidFixture"]
 
 #: §3: "IDs are opaque strings of at most 64 characters -- **including IDs in reset fixtures**".
@@ -64,17 +64,40 @@ CREATE TABLE IF NOT EXISTS idempotency (
 # The composite key is what `available_table_ids` being "tables *of that restaurant*" (§8) is
 # measured against, so it has to exist before any occupancy question across two restaurants can be
 # asked at all.
+# `ordinal` is the position of the row in its parent's *fixture* array, and it is the only ordering
+# §8:112 can be read against: it says "in fixture order" in as many words. Sorting by `id` answers a
+# different question -- alphabetical -- and on a fixture whose ids happen to be `t_1,t_2,t_3` the two
+# agree, which is why an unmet requirement can sit behind a green suite.
+#
+# It is per parent, not global: `ordinal` restarts at 0 for each restaurant, because the arrays are
+# nested and a table's position among its own restaurant's tables is the thing §8:112 means. The
+# unique index is on the pair so two tables of one restaurant cannot claim the same position; it is
+# NOT on `ordinal` alone, which would forbid the same position under two different restaurants.
+#
+# `ORDER BY rowid` is the cheaper-looking answer and is deliberately not used. `tables` has a
+# composite primary key and no INTEGER PRIMARY KEY, which is exactly the case where SQLite documents
+# that VACUUM may renumber ROWIDs -- so rowid order is an accident of insertion that a later
+# maintenance operation can silently invalidate. An ordinal written at insert is a contract; a rowid
+# is a side effect.
 TABLES_DDL = """
 CREATE TABLE IF NOT EXISTS tables (
     restaurant_id TEXT NOT NULL REFERENCES restaurants(id),
     id           TEXT NOT NULL,
     label        TEXT NOT NULL,
     capacity     INTEGER NOT NULL,
+    ordinal      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (restaurant_id, id)
 );
 """
 
-SCHEMA = """
+#: Applied after the ordinal migration, never before: `tables_by_ordinal` indexes a column that a
+#: pre-ordinal database does not have. See `ensure_schema`.
+SCHEMA_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS tables_by_ordinal
+    ON tables(restaurant_id, ordinal);
+"""
+
+SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
     email         TEXT NOT NULL UNIQUE,
@@ -114,6 +137,13 @@ CREATE TABLE IF NOT EXISTS reservations (
 CREATE INDEX IF NOT EXISTS reservations_by_table
     ON reservations(table_id, starts_at_utc);
 """ + IDEMPOTENCY_DDL
+
+#: The table declarations, under the name callers already read. It is `SCHEMA_TABLES` rather than the
+#: whole schema because the one index that must run after a migration lives in `SCHEMA_INDEXES`;
+#: concatenating it in would restore the failure `ensure_schema` documents. Kept so that code reading
+#: the DDL text -- `test_spec_stage1` takes `tables`' primary key out of it -- does not have to change
+#: to accommodate an ordering constraint it has no stake in.
+SCHEMA = SCHEMA_TABLES
 
 
 def database_path() -> pathlib.Path:
@@ -157,63 +187,129 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
 
 class InvalidFixture(ValueError):
-    """A reset fixture breaks a rule REQUIREMENTS states about it.
+    """A reset fixture breaks one or more rules REQUIREMENTS states about it.
 
-    One message, naming the path that failed, and only the first failure. §5:47 gives every 4xx and
-    5xx body exactly two keys, so there is nowhere to put a list of everything else that is wrong;
-    a caller who sends four bad fields is told about one, fixes it, sends it again, and is told
-    about the next.
+    One message naming every rule that broke, in fixture order, each carrying the JSON path it
+    applies to. §5:47 pins every 4xx and 5xx body to exactly two keys, so these cannot be a list --
+    they are one sentence in `message`, separated by `; `. That constraint and the requirement to
+    report everything are not in tension: `:47` fixes the *shape* of the body, and nothing in the
+    specification asks for one violation per round trip.
+
+    Reporting only the first was the older behaviour, and it was wrong in a way the transport hid:
+    a fixture with a user missing `password` *and* a reservation with `party_size: 0` answered
+    `users[1].password must be a non-empty string`, and the caller had no way to learn a second
+    defect existed until it had fixed the first, re-sent, and been told again. The masked error was
+    not a smaller sin than the reported one; it was invisible.
     """
 
 
-def _entries(fixture: dict, key: str) -> list[tuple[int, dict]]:
-    """`[(index, row)]` for one top-level array, every element already known to be an object."""
+class _Violations:
+    """Every rule a fixture breaks, in the order the fixture states them.
+
+    Collected rather than raised so that one bad field cannot hide the next. Validation still
+    happens **before** the transaction opens (see `_validated_fixture`), which is what keeps a
+    rejected fixture from being half-applied -- reporting everything does not weaken that ordering,
+    because nothing is written until the whole fixture has been walked.
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def add(self, message: str) -> None:
+        self.messages.append(message)
+
+    def __bool__(self) -> bool:
+        return bool(self.messages)
+
+    @property
+    def text(self) -> str:
+        return "; ".join(self.messages)
+
+
+def _entries(fixture: dict, key: str, bad: _Violations) -> list[tuple[int, dict]]:
+    """`[(index, row)]` for one top-level array, skipping elements that are not objects.
+
+    A non-object element is recorded and stepped over rather than ending the walk, so the indices
+    that follow it still name the positions the caller wrote. Those indices are what make the
+    message addressable: `users[3].email` has to mean the fourth entry of `users`.
+    """
     rows = fixture.get(key, [])
     if not isinstance(rows, list):
-        raise InvalidFixture(f"{key} must be an array")
+        bad.add(f"{key} must be an array")
+        return []
+    usable = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            raise InvalidFixture(f"{key}[{index}] must be an object")
-    return list(enumerate(rows))
+            bad.add(f"{key}[{index}] must be an object")
+            continue
+        usable.append((index, row))
+    return usable
 
 
-def _text(value: object, path: str) -> str:
+def _text(value: object, path: str, bad: _Violations) -> str | None:
     if not isinstance(value, str) or not value:
-        raise InvalidFixture(f"{path} must be a non-empty string")
+        bad.add(f"{path} must be a non-empty string")
+        return None
     return value
 
 
-def _identifier(value: object, path: str) -> str:
-    value = _text(value, path)
+def _identifier(value: object, path: str, bad: _Violations) -> str | None:
+    value = _text(value, path, bad)
+    if value is None:
+        return None
     if len(value) > MAX_ID_LENGTH:
-        raise InvalidFixture(f"{path} must be at most {MAX_ID_LENGTH} characters")
+        bad.add(f"{path} must be at most {MAX_ID_LENGTH} characters")
+        return None
     return value
 
 
-def _integer(value: object, path: str) -> int:
+def _integer(value: object, path: str, bad: _Violations) -> int | None:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise InvalidFixture(f"{path} must be an integer")
+        bad.add(f"{path} must be an integer")
+        return None
     return value
 
 
-def _positive(value: object, path: str) -> int:
-    value = _integer(value, path)
+def _positive(value: object, path: str, bad: _Violations) -> int | None:
+    value = _integer(value, path, bad)
+    if value is None:
+        return None
     if value < 1:
-        raise InvalidFixture(f"{path} must be a positive integer")
+        bad.add(f"{path} must be a positive integer")
+        return None
     return value
 
 
-def _nested(restaurant: dict, key: str, path: str) -> list[tuple[int, dict]]:
+def _hhmm(value: str | None, path: str, bad: _Violations) -> int | None:
+    """Minutes past local midnight, or `None` having recorded why not.
+
+    Returning the number rather than the string is what lets the closes-after-opens rule be a
+    comparison instead of a second parse, so a malformed `HH:MM` is reported once rather than
+    reported as a format error and again as a nonsensical ordering.
+    """
+    if value is None:
+        return None
+    if not _HHMM_RE.match(value):
+        bad.add(f"{path} must be local HH:MM on a 24-hour clock")
+        return None
+    return int(value[:2]) * 60 + int(value[3:])
+
+
+def _nested(restaurant: dict, key: str, path: str, bad: _Violations) -> list[tuple[int, dict]]:
     rows = restaurant.get(key, [])
     if not isinstance(rows, list):
-        raise InvalidFixture(f"{path}.{key} must be an array")
+        bad.add(f"{path}.{key} must be an array")
+        return []
+    usable = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            raise InvalidFixture(f"{path}.{key}[{index}] must be an object")
-    return list(enumerate(rows))
+            bad.add(f"{path}.{key}[{index}] must be an object")
+            continue
+        usable.append((index, row))
+    return usable
 
 
-def _instant(reservation: dict, zones: dict[str, str], path: str) -> str:
+def _instant(reservation: dict, zones: dict[str, str], path: str, bad: _Violations) -> str | None:
     """The instant a seeded booking occupies, as `YYYY-MM-DDTHH:MM:SS±HH:MM`.
 
     §4 gives a fixture reservation "the same fields as a create body plus `id`, `reference`,
@@ -225,23 +321,35 @@ def _instant(reservation: dict, zones: dict[str, str], path: str) -> str:
     A fixture that *does* carry `starts_at_utc` keeps it. A test pinning an absolute instant is
     isolating something other than this rule, and §9's absolute-time arithmetic is only checkable
     when the instant is one the test chose.
+
+    Returns `None` having recorded why, so one unusable booking does not stop the rest being
+    checked. Every read of the reservation is therefore guarded: the caller reaches here only when
+    `restaurant_id` is a usable id present in `zones`, but `starts_at_local` itself is a field the
+    fixture may simply omit, and indexing it unguarded is the `KeyError` this docstring is about.
     """
     if "starts_at_utc" in reservation:
-        return reservation["starts_at_utc"]
+        return _text(reservation["starts_at_utc"], f"{path}.starts_at_utc", bad)
+
+    local = _text(reservation.get("starts_at_local"), f"{path}.starts_at_local", bad)
+    if local is None:
+        return None
     try:
-        naive = parse_local(reservation["starts_at_local"])
-    except ValueError as exc:
-        raise InvalidFixture(f"{path}.starts_at_local must look like YYYY-MM-DDTHH:MM") from exc
+        naive = parse_local(local)
+    except ValueError:
+        bad.add(f"{path}.starts_at_local must look like YYYY-MM-DDTHH:MM")
+        return None
     try:
         zone = ZoneInfo(zones[reservation["restaurant_id"]])
-    except LookupError as exc:
-        raise InvalidFixture(f"{path}.restaurant_id names a restaurant whose timezone is not"
-                             " known to this platform") from exc
+    except LookupError:
+        bad.add(f"{path}.restaurant_id names a restaurant whose timezone is not"
+                " known to this platform")
+        return None
     try:
         return resolve(naive, zone).isoformat()
-    except ValueError as exc:
-        raise InvalidFixture(f"{path}.starts_at_local falls inside a clock change, so that local"
-                             " time never happened") from exc
+    except ValueError:
+        bad.add(f"{path}.starts_at_local falls inside a clock change, so that local"
+                " time never happened")
+        return None
 
 
 def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
@@ -250,12 +358,21 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
     Returns `(zones, instants)`: each restaurant's timezone keyed by id, and the derived instant of
     each seeded reservation that did not carry one, keyed by its index in `reservations`.
 
-    **Whole fixture, in fixture order, before the transaction.** Two reasons, and the ordering is
-    the only thing that delivers either. First, a failure halfway through a transaction would be a
-    rollback, not a rejection: `transaction()` restores the *previous* fixture, so a 422 raised
-    mid-insert would hand the caller an error and leave the world it asked to replace still in
-    place. Second, first-error-wins is only stable if the first error is decided by the fixture's
-    own order rather than by which constraint SQLite happened to reach first.
+    **Whole fixture, in fixture order, before the transaction.** A failure halfway through a
+    transaction would be a rollback, not a rejection: `transaction()` restores the *previous*
+    fixture, so a 422 raised mid-insert would hand the caller an error and leave the world it asked
+    to replace still in place. That ordering is what makes a rejection trustworthy, and it is why
+    the whole walk completes before `reset_database` writes a single row.
+
+    **Every violation, not the first.** Each check records and continues rather than raising, so the
+    answer names every rule the fixture broke instead of the first one the walk reached. The two
+    decisions are independent: reporting everything does not weaken "validate before you write",
+    because nothing is written until the walk finishes either way.
+
+    Reporting every violation does mean a field the walk could not use is skipped rather than
+    descended into -- a `restaurant_id` that is not a usable string is reported once, and the
+    reservation's own `starts_at_local` is not additionally reported as missing, because the
+    fixture is already known to be unusable and a second sentence about it would be noise.
 
     What is deliberately *not* checked: the timezone against the IANA database, and a seeded
     reservation against its table's capacity or opening hours. §4 constrains neither, a restaurant
@@ -263,59 +380,71 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
     when it is stored), and §4 says a booking is not rejected for being in the past -- so the
     rules that do exist are the ones checked here.
     """
-    for index, user in _entries(fixture, "users"):
+    bad = _Violations()
+
+    for index, user in _entries(fixture, "users", bad):
         path = f"users[{index}]"
-        _identifier(user.get("id"), f"{path}.id")
-        _text(user.get("email"), f"{path}.email")
-        _text(user.get("password"), f"{path}.password")
+        _identifier(user.get("id"), f"{path}.id", bad)
+        _text(user.get("email"), f"{path}.email", bad)
+        _text(user.get("password"), f"{path}.password", bad)
         if "display_name" in user:
-            _text(user["display_name"], f"{path}.display_name")
+            _text(user["display_name"], f"{path}.display_name", bad)
 
     zones: dict[str, str] = {}
-    for index, restaurant_row in _entries(fixture, "restaurants"):
+    for index, restaurant_row in _entries(fixture, "restaurants", bad):
         path = f"restaurants[{index}]"
-        restaurant_id = _identifier(restaurant_row.get("id"), f"{path}.id")
-        _text(restaurant_row.get("name"), f"{path}.name")
-        zones[restaurant_id] = _text(restaurant_row.get("timezone"), f"{path}.timezone")
-        _positive(restaurant_row.get("slot_minutes"), f"{path}.slot_minutes")
+        restaurant_id = _identifier(restaurant_row.get("id"), f"{path}.id", bad)
+        _text(restaurant_row.get("name"), f"{path}.name", bad)
+        timezone = _text(restaurant_row.get("timezone"), f"{path}.timezone", bad)
+        if restaurant_id is not None and timezone is not None:
+            zones[restaurant_id] = timezone
+        _positive(restaurant_row.get("slot_minutes"), f"{path}.slot_minutes", bad)
         _positive(restaurant_row.get("reservation_duration_minutes"),
-                  f"{path}.reservation_duration_minutes")
+                  f"{path}.reservation_duration_minutes", bad)
         cutoff = _integer(restaurant_row.get("cancellation_cutoff_minutes"),
-                          f"{path}.cancellation_cutoff_minutes")
-        if cutoff < 0:
-            raise InvalidFixture(f"{path}.cancellation_cutoff_minutes must not be negative")
+                          f"{path}.cancellation_cutoff_minutes", bad)
+        if cutoff is not None and cutoff < 0:
+            bad.add(f"{path}.cancellation_cutoff_minutes must not be negative")
 
-        for hours_index, hours in _nested(restaurant_row, "opening_hours", path):
+        for hours_index, hours in _nested(restaurant_row, "opening_hours", path, bad):
             hours_path = f"{path}.opening_hours[{hours_index}]"
             if hours.get("weekday") not in _WEEKDAYS:
-                raise InvalidFixture(f"{hours_path}.weekday must be one of "
-                                     f"{' '.join(_WEEKDAYS)}")
-            opens = _text(hours.get("opens"), f"{hours_path}.opens")
-            closes = _text(hours.get("closes"), f"{hours_path}.closes")
-            if not _HHMM_RE.match(opens) or not _HHMM_RE.match(closes):
-                raise InvalidFixture(f"{hours_path}.opens and .closes must be local HH:MM "
-                                     "on a 24-hour clock")
-            if int(closes[:2]) * 60 + int(closes[3:]) <= int(opens[:2]) * 60 + int(opens[3:]):
-                raise InvalidFixture(f"{hours_path}.closes must be later than .opens on the same "
-                                     "local day, because hours never cross midnight")
+                bad.add(f"{hours_path}.weekday must be one of "
+                        f"{' '.join(_WEEKDAYS)}")
+            opens = _text(hours.get("opens"), f"{hours_path}.opens", bad)
+            closes = _text(hours.get("closes"), f"{hours_path}.closes", bad)
+            opens_minutes = _hhmm(opens, f"{hours_path}.opens", bad)
+            closes_minutes = _hhmm(closes, f"{hours_path}.closes", bad)
+            if opens_minutes is not None and closes_minutes is not None \
+                    and closes_minutes <= opens_minutes:
+                bad.add(f"{hours_path}.closes must be later than .opens on the same "
+                        "local day, because hours never cross midnight")
 
-        for table_index, table_row in _nested(restaurant_row, "tables", path):
+        for table_index, table_row in _nested(restaurant_row, "tables", path, bad):
             table_path = f"{path}.tables[{table_index}]"
-            _identifier(table_row.get("id"), f"{table_path}.id")
-            _text(table_row.get("label"), f"{table_path}.label")
-            _positive(table_row.get("capacity"), f"{table_path}.capacity")
+            _identifier(table_row.get("id"), f"{table_path}.id", bad)
+            _text(table_row.get("label"), f"{table_path}.label", bad)
+            _positive(table_row.get("capacity"), f"{table_path}.capacity", bad)
 
     instants: dict[int, str] = {}
-    for index, reservation in _entries(fixture, "reservations"):
+    for index, reservation in _entries(fixture, "reservations", bad):
         path = f"reservations[{index}]"
-        _identifier(reservation.get("reference"), f"{path}.reference")
-        restaurant_id = _identifier(reservation.get("restaurant_id"), f"{path}.restaurant_id")
-        if restaurant_id not in zones:
-            raise InvalidFixture(f"{path}.restaurant_id must name a restaurant in this fixture")
-        _text(reservation.get("table_id"), f"{path}.table_id")
-        _identifier(reservation.get("user_id"), f"{path}.user_id")
-        _positive(reservation.get("party_size"), f"{path}.party_size")
-        instants[index] = _instant(reservation, zones, path)
+        _identifier(reservation.get("reference"), f"{path}.reference", bad)
+        restaurant_id = _identifier(reservation.get("restaurant_id"),
+                                    f"{path}.restaurant_id", bad)
+        known = restaurant_id is not None and restaurant_id in zones
+        if restaurant_id is not None and not known:
+            bad.add(f"{path}.restaurant_id must name a restaurant in this fixture")
+        _text(reservation.get("table_id"), f"{path}.table_id", bad)
+        _identifier(reservation.get("user_id"), f"{path}.user_id", bad)
+        _positive(reservation.get("party_size"), f"{path}.party_size", bad)
+        if known:
+            instant = _instant(reservation, zones, path, bad)
+            if instant is not None:
+                instants[index] = instant
+
+    if bad:
+        raise InvalidFixture(bad.text)
 
     return zones, instants
 
@@ -364,11 +493,12 @@ def reset_database(fixture: dict) -> None:
                     " VALUES (?, ?, ?, ?)",
                     (restaurant["id"], hours["weekday"], hours["opens"], hours["closes"]),
                 )
-            for table in restaurant.get("tables", []):
+            for table_ordinal, table in enumerate(restaurant.get("tables", [])):
                 conn.execute(
-                    "INSERT INTO tables (restaurant_id, id, label, capacity)"
-                    " VALUES (?, ?, ?, ?)",
-                    (restaurant["id"], table["id"], table["label"], table["capacity"]),
+                    "INSERT INTO tables (restaurant_id, id, label, capacity, ordinal)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (restaurant["id"], table["id"], table["label"], table["capacity"],
+                     table_ordinal),
                 )
 
         for index, reservation in enumerate(fixture.get("reservations", [])):
@@ -390,12 +520,21 @@ def ensure_schema() -> None:
     Safe to call on every start, which is what `serve()` does: `CREATE TABLE IF NOT EXISTS` only
     creates what is missing, so the two migrations below are what make a *changed* declaration take
     effect on a database that already exists.
+
+    **`SCHEMA` is applied in two halves, and the split is load-bearing.** `tables_by_ordinal` indexes
+    a column that a database written before this change does not have, so applying the whole
+    declaration first would fail with `no such column: ordinal` on exactly the legacy database the
+    migration exists to repair. The indexes therefore run *after* `_add_fixture_order_ordinals` has
+    added the column, rather than being tolerated in a try/except: a swallowed failure here would
+    leave the index missing on every future start, and nothing would report it.
     """
     conn = connect()
     try:
-        conn.executescript(SCHEMA)
+        conn.executescript(SCHEMA_TABLES)
         _widen_tables_key_to_the_restaurant(conn)
         _widen_idempotency_for_path_scoping(conn)
+        _add_table_fixture_ordinals(conn)
+        conn.executescript(SCHEMA_INDEXES)
     finally:
         conn.close()
 
@@ -442,9 +581,73 @@ def _widen_tables_key_to_the_restaurant(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tables RENAME TO tables__pre_restaurant_key")
         conn.execute(TABLES_DDL)
         conn.execute(
-            "INSERT INTO tables (restaurant_id, id, label, capacity)"
-            " SELECT restaurant_id, id, label, capacity FROM tables__pre_restaurant_key")
+            "INSERT INTO tables (restaurant_id, id, label, capacity, ordinal)"
+            " SELECT restaurant_id, id, label, capacity,"
+            " ROW_NUMBER() OVER (PARTITION BY restaurant_id ORDER BY id) - 1"
+            " FROM tables__pre_restaurant_key")
         conn.execute("DROP TABLE tables__pre_restaurant_key")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _add_table_fixture_ordinals(conn: sqlite3.Connection) -> None:
+    """Give `tables` an `ordinal` recording its position in its restaurant's fixture array.
+
+    §8:112 asks for `available_table_ids` "in fixture order" in as many words, and sorting by `id`
+    answers a different question -- alphabetical -- which coincides with fixture order only on a
+    fixture whose ids are already sorted. `ALTER TABLE ... ADD COLUMN` is enough: the column is
+    `NOT NULL DEFAULT 0`, which SQLite permits on a table that already has rows, so unlike the
+    primary-key widenings above this needs no rebuild and cannot lose a row.
+
+    **Only `tables`.** `restaurants` deliberately keeps its shape. §8:99 specifies the restaurant
+    list's envelope and its three fields and says nothing about order, unlike §8:112; adding a
+    column for an order nothing requires would also break every positional
+    `INSERT INTO restaurants VALUES (...)` in the suite for no gain. If restaurant order is ever
+    wanted it is one column and one migration, and it should be argued for on the specification
+    rather than smuggled in beside a requirement that does need it.
+
+    **The backfill is deterministic but it is not the truth, and that is fine.** A row's real ordinal
+    lived only in the JSON array that produced it, and that array is gone -- so for a database
+    written before this column the best available answer is *some* fixed order, and `(restaurant_id,
+    id)` gives the same one on every machine. That looked like a hazard until `reset` was taken into
+    account: `reset_database` deletes every row of all seven tables and rewrites them from the
+    fixture in array order, so `tables` rows exist *only* as a product of a reset. A pre-ordinal
+    database is one built by an older binary and never reset since, and no API can observe its
+    ordinals, because the first reset converges them to true fixture order. Two databases with
+    identical logical content returning different orderings is therefore not reachable through the
+    service, and the backfill only has to be stable, not faithful.
+
+    **The unique index is created after the backfill, not before.** Created first, it would fail:
+    every row would still hold the `DEFAULT 0`, and `(restaurant_id, 0)` collides on the second table
+    of a restaurant.
+
+    **The shape is read inside the write lock, not before it.** Same invariant, and the same reason
+    it was wrong twice already in this file: read outside the transaction and a second process blocks
+    on `BEGIN IMMEDIATE` while holding a decision made about a table the first one has already
+    altered. The rebuild is idempotent, so the damage is bounded to doing it twice -- but reading a
+    migration's own precondition under the lock it holds is the invariant, and it is worth one
+    uncontended `BEGIN`/`COMMIT` per start to keep.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        info = list(conn.execute("PRAGMA table_info(tables)"))
+        if info and "ordinal" not in {row["name"] for row in info}:
+            conn.execute("ALTER TABLE tables ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0")
+            # Assigned in Python rather than with `ROW_NUMBER() OVER (...)`: SQLite rejects a window
+            # function directly in an UPDATE's SET, and a correlated subquery would make this depend
+            # on a window-function-capable SQLite to count the rows of a fixture-sized table.
+            seen: dict[str, int] = {}
+            for group, identifier in conn.execute(
+                    "SELECT restaurant_id, id FROM tables ORDER BY restaurant_id, id"
+            ):
+                position = seen.get(group, 0)
+                seen[group] = position + 1
+                conn.execute(
+                    "UPDATE tables SET ordinal = ? WHERE restaurant_id = ? AND id = ?",
+                    (position, group, identifier),
+                )
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
