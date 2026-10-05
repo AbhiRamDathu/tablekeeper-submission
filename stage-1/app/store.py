@@ -548,15 +548,27 @@ def ensure_schema() -> None:
     """Create tables if absent, and carry an older database forward. Idempotent.
 
     Safe to call on every start, which is what `serve()` does: `CREATE TABLE IF NOT EXISTS` only
-    creates what is missing, so the two migrations below are what make a *changed* declaration take
+    creates what is missing, so the four migrations below are what make a *changed* declaration take
     effect on a database that already exists.
 
-    **`SCHEMA` is applied in two halves, and the split is load-bearing.** `tables_by_ordinal` indexes
-    a column that a database written before this change does not have, so applying the whole
-    declaration first would fail with `no such column: ordinal` on exactly the legacy database the
-    migration exists to repair. The indexes therefore run *after* `_add_fixture_order_ordinals` has
-    added the column, rather than being tolerated in a try/except: a swallowed failure here would
-    leave the index missing on every future start, and nothing would report it.
+    **`SCHEMA` is applied in two halves, and the split is load-bearing.** `tables_by_ordinal` and
+    `opening_hours_by_ordinal` index columns that a database written before this change does not
+    have, so applying the whole declaration first would fail with `no such column: ordinal` on exactly
+    the legacy database the migration exists to repair. The indexes therefore run *after*
+    `_add_table_fixture_ordinals` and `_add_opening_hours_fixture_ordinals` have added their columns,
+    rather than being tolerated in a try/except: a swallowed failure here would leave the index missing
+    on every future start, and nothing would report it.
+
+    **The key widening and the column additions are separate migrations on purpose, and the order is
+    what makes each one's guard sufficient.** A read that concludes "the key is already composite" is
+    not a read that concludes "nothing is left to do", and collapsing the two into one guard is how a
+    database that already passed the widening would skip the backfill forever -- the failure this
+    file's own warning describes, arriving through a fix. Measured on all three shapes a legacy file
+    can have: global `id` key goes through the widen, whose `ROW_NUMBER() OVER (...)` already writes
+    sequential ordinals, so the column migration then finds the column present and does nothing;
+    composite key with no ordinal goes past the widen's guard untouched and is repaired by
+    `_add_table_fixture_ordinals`, which tests for the *column*; composite key with the column is left
+    alone entirely.
     """
     conn = connect()
     try:
