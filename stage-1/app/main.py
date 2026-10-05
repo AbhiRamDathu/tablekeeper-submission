@@ -654,14 +654,21 @@ def post_reservation_moves(request, match):
 
     Two passes inside a single transaction, and the ordering between them is the point of :197:
 
-    1. every item's non-occupancy checks, walked in input order -- 404, cancelled, cutoff, the
-       shared restaurant, then the ordinary amendment field rules;
+    1. every item's non-occupancy checks, walked in input order -- 404, cancelled, the shared
+       restaurant, the cutoff, then the ordinary amendment field rules;
     2. then occupancy, also in input order, applying each item as it clears so the next item is
        checked against its predecessor's *destination*. That is what makes :199's "overlap among
        resulting bookings" fall out without a second copy of the conflict logic.
 
     Nothing here commits until every item is through both passes, so no caller can observe a
     half-applied batch and a failure leaves reservations and occupancy untouched, as :201 requires.
+
+    What pass one does *not* do is read ahead. Every check an item needs is applied to that item
+    when the walk reaches it, so :197's "in input order" is observable: item 1's 404 outranks item
+    7's malformed field, and the caller is always told about the batch's earliest non-occupancy
+    error. A validation sweep over the whole array first would answer differently depending on how
+    many items the caller happened to send -- item 7's type error pre-empting item 1's missing
+    booking -- and §11 nowhere asks for that.
     """
     user = request.require_user()
     key = request.headers.get("Idempotency-Key")
@@ -726,6 +733,25 @@ def post_reservation_moves(request, match):
             table_id = item.get("table_id", row["table_id"])
             starts_at_local = item.get("starts_at_local", row["starts_at_local"])
             party_size = item.get("party_size", row["party_size"])
+
+            # The item's own wrong-JSON-type rules, here rather than in `_validated_moves`, because
+            # :197 makes the *batch's* earliest non-occupancy error the answer. `table_id` and
+            # `starts_at_local` answer 400 `malformed_request` -- §5:48's generic rule, and the code
+            # `patch_reservation` already gives the same two fields. `party_size` answers 422
+            # because §5:57 says so in as many words; that row contradicts §5:48 and the
+            # contradiction is an open named defect (`party_size_wrong_type_is_422`) that this
+            # endpoint inherits rather than settles.
+            #
+            # Position matters as much as the code. Above the cutoff is §11:198's "cutoff errors
+            # preceding other changes for that booking"; below it, because a booking already inside
+            # its window cannot be amended whatever the amendment says.
+            if not isinstance(table_id, str):
+                raise _malformed("table_id must be a string")
+            if not isinstance(starts_at_local, str):
+                raise _malformed("starts_at_local must be a string")
+            if not isinstance(party_size, int) or isinstance(party_size, bool):
+                raise _invalid("party_size must be an integer")
+
             table, starts = _validate_booking_fields(conn, restaurant, table_id,
                                                      starts_at_local, party_size)
             planned.append((reference, table, starts, table_id, starts_at_local, party_size))
@@ -765,21 +791,28 @@ def post_reservation_moves(request, match):
 
 
 def _validated_moves(body):
-    """§11:185-186, :192 -- the shape of `moves` itself, before any resource is touched.
+    """§11:185-186 -- the shape of the batch itself, before any resource is touched.
 
-    Two codes, and the split is the spec's rather than this function's:
+    Four rules, all of them 422 `validation_failed` because all four are the shape §11:186 names: the
+    array, its length, each entry being an object, and "distinct string references". A `reference`
+    of the wrong JSON type is 422 because §11:186 says *string references* in as many words.
 
-    * 422 `validation_failed` for the shape §11:186 names -- the array, its length, each entry being
-      an object, and a "distinct string reference". A `reference` of the wrong JSON type is 422
-      because §11:186 says *string references* in as many words.
-    * 400 `malformed_request` for a wrong-typed `table_id` or `starts_at_local`, which is §5:48's
-      generic wrong-JSON-type rule and is also the code `patch_reservation` already answers with for
-      the same two fields. §11:197 says a move's non-occupancy errors "use ordinary amendment
-      codes", and this is the ordinary amendment code.
+    Batch shape only, and the boundary is §11:197's. A move object's *field* types are not the
+    batch's shape -- they are that item's ordinary amendment rules, and :197 settles a batch by
+    reporting its earliest non-occupancy error in input order. Judging item 7's `table_id` here
+    would answer with item 7's error while item 1's booking is missing, which is the opposite of
+    "in input order" and would make the answer depend on the batch's length. Those checks therefore
+    run inside the walk, in `post_reservation_moves`.
 
-    `party_size` stays 422 on purpose. §5:57 makes a wrong-typed `party_size` a 422, which
-    contradicts §5:48, and that contradiction is an open named defect
-    (`party_size_wrong_type_is_422` in `test_spec_stage1.py`) rather than this endpoint's to settle.
+    Two things this function deliberately does not decide:
+
+    * Whether a body that is not an object, or a `moves` that is not an array, is 400 or 422. §5:48
+      makes a wrong JSON type 400; §11:186 makes an invalid shape 422; a non-object body is
+      answered 400 before this is reached, and a non-array `moves` is answered 422 because it is
+      §11:186's own "1-8 objects" rule about an `moves` that is not a list of objects. That split is
+      pinned by `BatchShape`, not inferred here.
+    * `party_size`, whose wrong-typed case is 422 by §5:57 in contradiction to §5:48. The check
+      travels with the other field types in the walk, keeping the 422 §5:57 asks for.
 
     Unknown fields in an item are ignored rather than rejected, per §3:28.
     """
@@ -800,13 +833,6 @@ def _validated_moves(body):
         if reference in seen:
             raise _invalid("move references must be distinct")
         seen.add(reference)
-        if "table_id" in item and not isinstance(item["table_id"], str):
-            raise _malformed("table_id must be a string")
-        if "starts_at_local" in item and not isinstance(item["starts_at_local"], str):
-            raise _malformed("starts_at_local must be a string")
-        if "party_size" in item and (not isinstance(item["party_size"], int)
-                                     or isinstance(item["party_size"], bool)):
-            raise _invalid("party_size must be an integer")
     return moves
 
 

@@ -1505,3 +1505,86 @@ class BatchReceiptsSurviveExportImport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class NonOccupancyInputOrder(MovesCase):
+    """§11:197 -- the batch's *earliest* non-occupancy error is the one the caller is told about.
+
+    Four classes of non-occupancy error, and four ways a field's wrong JSON type could pre-empt one
+    of them. The bug these pin is narrow and was in one function: `_validated_moves` swept every
+    item's field types before the ordered pass began, so item 7's `table_id: 7` was answered 400
+    while item 1's booking did not exist. That is not :197's order -- it is "the last item to have a
+    bad field wins", which makes the response a function of batch length as well as of batch content.
+
+    Every case here is the same shape: a legal batch whose *earlier* item carries one of the four
+    non-occupancy errors, and whose *later* item carries a wrong-typed field. The expected answer is
+    the earlier error, in all four. `WrongJsonType` covers the code that the wrong-typed field is
+    owed when nothing outranks it; these cover that it is only owed then.
+    """
+
+    #: Both fields `_validated_moves` used to pre-check, with a value of the wrong JSON type.
+    WRONG_TYPES = {"table_id": 7, "starts_at_local": 7}
+
+    def assertOutranked(self, moves, want, key):
+        """Post `moves` and return the response, asserting `want` for every wrong-typed field."""
+        for field, value in self.WRONG_TYPES.items():
+            with self.subTest(late_field=field):
+                resp = self.moves(moves(late={field: value}), key=f"{key}-{field}")
+                self.assertEqual((resp.status, resp.code), want, resp.raw)
+
+    def test_a_not_found_on_an_earlier_item_outranks_a_later_wrong_typed_field(self):
+        """:189 against §5:48 -- the missing booking is first in input order, so it is the answer."""
+        mine = self.create(table_id="t_2", at="19:00", party_size=2, key="k-mine")
+        before = self.current(self.ada, mine)
+        self.assertOutranked(
+            lambda late: [{"reference": "ZZZZZZ"}, dict(late, reference=mine)],
+            (404, "not_found"), "k-ord-404")
+        self.assertEqual(self.current(self.ada, mine), before, ":201 -- nothing moved")
+
+    def test_a_cancelled_booking_outranks_a_later_wrong_typed_field(self):
+        """:195 against §5:48, on the same argument."""
+        self.reset(reservations=[seeded(
+            "CANCEL1", table_id="t_1", user_id=ADA["id"],
+            starts_at_local=local(self.day, "18:00"),
+            starts_at_utc=f"{self.day}T16:00:00+00:00", party_size=2, status="cancelled")])
+        self.resign_in()
+        mine = self.create(table_id="t_2", at="19:00", party_size=2, key="k-mine")
+        self.assertOutranked(
+            lambda late: [{"reference": "CANCEL1"}, dict(late, reference=mine)],
+            (409, "reservation_cancelled"), "k-ord-cancelled")
+
+    def test_a_two_restaurant_batch_outranks_a_later_wrong_typed_field(self):
+        """:190 against §5:48, with the offending item third so the mismatch is found at item 2.
+
+        Both bookings are Ada's own and the type error sits on a third item at the *first*
+        restaurant, so nothing else in the batch can be the reason: item 1 passes, item 2 is the
+        restaurant that does not match it, and item 3 is never reached.
+        """
+        self.reset(restaurants=two_restaurants(shared_table_ids=False))
+        self.resign_in()
+        here = self.create(restaurant_id="r_one", table_id="t_1", at="19:00", key="k-here")
+        there = self.create(restaurant_id="r_two", table_id="u_1", at="19:00", key="k-there")
+        also_here = self.create(restaurant_id="r_one", table_id="t_2", at="18:00",
+                                party_size=1, key="k-also")
+        self.assertOutranked(
+            lambda late: [{"reference": here}, {"reference": there},
+                          dict(late, reference=also_here)],
+            (422, "validation_failed"), "k-ord-restaurants")
+
+    def test_a_cutoff_on_an_earlier_item_outranks_a_later_wrong_typed_field(self):
+        """:196 and :198 against §5:48 -- the window closes on the first booking in the batch.
+
+        A 30-day cutoff swallows a booking 7 days out, the same device `Cutoff` uses, so no test has
+        to move the clock. `party_size: 0` in `Cutoff.test_a_cutoff_error_comes_before_the_field_
+        error_for_the_same_booking` already covers the wrong *value* on the same booking; this one
+        covers a wrong *type* on a later booking, which is the case the pre-validation sweep broke.
+        """
+        self.reset(restaurants=[restaurant(cancellation_cutoff_minutes=60 * 24 * 30)])
+        self.resign_in()
+        inside = self.create(table_id="t_1", at="18:00", party_size=1, key="k-inside")
+        later = self.create(table_id="t_2", at="19:00", party_size=2, key="k-later")
+        before = self.current(self.ada, later)
+        self.assertOutranked(
+            lambda late: [{"reference": inside}, dict(late, reference=later)],
+            (409, "cutoff_passed"), "k-ord-cutoff")
+        self.assertEqual(self.current(self.ada, later), before, ":201 -- nothing moved")
+
+
