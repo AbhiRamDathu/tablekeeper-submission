@@ -307,7 +307,7 @@ def get_restaurant(request, match):
         ).fetchall()
         hours = conn.execute(
             "SELECT weekday, opens, closes FROM opening_hours WHERE restaurant_id = ?"
-            " ORDER BY weekday", (row["id"],),
+            " ORDER BY ordinal, weekday, opens, closes", (row["id"],),
         ).fetchall()
     finally:
         conn.close()

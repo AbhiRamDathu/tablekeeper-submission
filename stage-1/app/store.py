@@ -620,6 +620,55 @@ _STATE_TABLES_SPEC: dict[str, tuple[tuple[str, type], ...]] = {
 _STATE_DELETE_ORDER = ("idempotency", "reservations", "tokens", "opening_hours",
                        "tables", "restaurants", "users")
 
+#: Every set of columns whose rows must be distinct within a table, per table. The first tuple of a
+#: table is its primary key; the rest are the other uniqueness the schema declares.
+#:
+#: This exists because §10:169 requires "an invalid state" to be refused with 422 *before* the
+#: destination changes, and a primary key twice is invalid state by the plainest reading available --
+#: yet `sqlite3` raises it as an `IntegrityError` from inside the write, which the handler's catch-all
+#: turns into `500 internal_error`. That is wrong twice: §10:170 asks for 422, and REQUIREMENTS.md:17
+#: ("No 5xx responses, including under concurrent load") is unconditional, and this is neither.
+#:
+#: `users.email` and the `tables_by_ordinal` unique index are here for the same reason as the primary
+#: keys and are the two a hand-written check most often forgets -- an email carried twice and a second
+#: table claiming one fixture position are both states this service could not have exported.
+#:
+#: `opening_hours` has no entry beyond an empty tuple and that is deliberate, not an omission:
+#: `opening_hours_by_ordinal` is a *plain* index, precisely so that a byte-identical duplicate row is
+#: representable. `SCHEMA_INDEXES` records why, and adding a uniqueness rule here would refuse a state
+#: the database itself accepts -- which §10:165 forbids, because import must accept an unchanged
+#: export of ours.
+_STATE_UNIQUE_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "users": (("id",), ("email",)),
+    "tokens": (("token",),),
+    "restaurants": (("id",),),
+    "opening_hours": (),
+    "tables": (("restaurant_id", "id"), ("restaurant_id", "ordinal")),
+    "reservations": (("reference",),),
+    "idempotency": (("key", "user_id", "scope"),),
+}
+
+#: Every `(column, parent table, parent column)` a `state` row must find already present in the rows
+#: it carries, per table.
+#:
+#: The same reason as `_STATE_UNIQUE_KEYS`, from the other side: `connect()` sets
+#: `PRAGMA foreign_keys=ON`, so a child naming a parent the state does not contain fails the write as
+#: an `IntegrityError` -- a 500 where §10:170 asks for a 422.
+#:
+#: Only what `SCHEMA_TABLES` declares is listed. `reservations.restaurant_id`, `.table_id` and
+#: `.user_id` are plain `TEXT` with no `REFERENCES` clause, and restating them here would make import
+#: refuse states the database would have accepted; the section is about a round trip of this
+#: service's own export, and this service never writes a reservation that points at nothing.
+_STATE_FOREIGN_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "users": (),
+    "tokens": (("user_id", "users", "id"),),
+    "restaurants": (),
+    "opening_hours": (("restaurant_id", "restaurants", "id"),),
+    "tables": (("restaurant_id", "restaurants", "id"),),
+    "reservations": (),
+    "idempotency": (),
+}
+
 #: The order an export reads each table in. Nothing here is a product requirement -- an export may
 #: list its rows in whatever order is cheapest -- but it *is* the reason
 #: `export(import(state)) == state` holds, which §10:165 turns on: import accepts the object
@@ -722,6 +771,12 @@ def import_state(state: object) -> None:
     is written, which is what removes "all previous destination data and credentials" (§10:180) --
     including an account created after the export, whose token then resolves to nothing and answers
     401 rather than authenticating an account that no longer exists.
+
+    **A constraint `sqlite3` is the only one to notice is still a 422, not a 500.**
+    `_validated_state` enumerates the declared ones; this is the floor under that enumeration, so a
+    constraint added to the schema later answers 422 rather than escaping as `internal_error`. The
+    message is ours and names the table rather than repeating `sqlite3`'s text, because §5 pins the
+    body to two keys and a raw constraint string is schema detail served on an unauthenticated route.
     """
     _validated_state(state)
     with transaction() as conn:
@@ -731,22 +786,34 @@ def import_state(state: object) -> None:
             names = [name for name, _ in spec]
             placeholders = ", ".join("?" * len(names))
             statement = (f"INSERT INTO {table} ({', '.join(names)}) VALUES ({placeholders})")
-            for row in state[table]:
-                conn.execute(statement, tuple(row[name] for name in names))
+            try:
+                for row in state[table]:
+                    conn.execute(statement, tuple(row[name] for name in names))
+            except sqlite3.IntegrityError as exc:
+                raise InvalidState(
+                    f"state.{table} does not satisfy the constraints the schema declares") from exc
 
 
 def _validated_state(state: object) -> None:
     """Every rule §10 states about a `state`, checked before any transaction is opened.
 
-    Three levels, and which one a bad object fails at is worth stating because it decides the
-    message: a `state` that is not an object, or that does not carry `STATE_SCHEMA`, is refused
-    immediately -- it is not this service's export and there is nothing to walk -- while a row or a
-    column that is the wrong shape is collected, so one object with two bad fields names both.
+    Two levels, and which one a bad object fails at is worth stating because it decides the
+    message: a `state` that is not an object, that does not carry `STATE_SCHEMA`, that is missing a
+    collection, or that holds a row which is not an object, is refused immediately -- it is not this
+    service's export and there is nothing to walk -- while everything *inside* a well-shaped row is
+    collected, so one object with two bad fields names both.
 
     The type of every column is checked rather than assumed, and `int` excludes `bool`. That is not
     fastidiousness: `sqlite3` binds a Python `True` as `1` without complaint, so an export claiming
     `party_size: true` would be stored as a party of one and answer 201 for a booking nobody asked
     for. §10:170 says an invalid state is 422, and the only place to notice is before the write.
+
+    The same argument settles why `_check_state_keys` and `_check_state_references` are here rather
+    than left to the database. A row that repeats a primary key, or a token naming a user the state
+    does not contain, is invalid state on the plainest reading available; asked of `sqlite3` instead
+    it comes back as an `IntegrityError` from inside the write, which the handler answers as
+    `500 internal_error`. §10:170 wants 422 and REQUIREMENTS.md:17 rules out the 5xx unconditionally,
+    so the constraint has to be known before the transaction opens rather than discovered inside it.
 
     Value rules §4 states about a *fixture* are deliberately not restated here. A `state` is not
     authored by a caller from the specification -- §10 makes it opaque and requires import to accept
@@ -759,11 +826,13 @@ def _validated_state(state: object) -> None:
         raise InvalidState(f"state.schema must be {STATE_SCHEMA!r}")
 
     bad = _Violations()
+    rows: dict[str, list[dict]] = {}
     for table, spec in _STATE_TABLES_SPEC.items():
-        rows = state.get(table)
-        if not isinstance(rows, list):
+        entries = state.get(table)
+        if not isinstance(entries, list):
             raise InvalidState(f"state.{table} must be an array")
-        for index, row in enumerate(rows):
+        rows[table] = []
+        for index, row in enumerate(entries):
             path = f"state.{table}[{index}]"
             if not isinstance(row, dict):
                 raise InvalidState(f"{path} must be an object")
@@ -777,8 +846,50 @@ def _validated_state(state: object) -> None:
                 if not usable:
                     bad.add(f"{path}.{column} must be "
                             + ("an integer" if kind is int else "a string"))
+            rows[table].append(row)
+    _check_state_keys(rows, bad)
+    _check_state_references(rows, bad)
     if bad:
         raise InvalidState(bad.text)
+
+
+def _check_state_keys(rows: dict[str, list[dict]], bad: _Violations) -> None:
+    """No two rows of one table may carry the same value for a key `_STATE_UNIQUE_KEYS` names.
+
+    Every column is read with `.get`, so a row that is missing one is *also* named here rather than
+    raising `KeyError` -- it is already a violation the type pass recorded, and this function must not
+    be the thing that turns a reportable state into a 500.
+    """
+    for table, keys in _STATE_UNIQUE_KEYS.items():
+        for key in keys:
+            seen: set[tuple[object, ...]] = set()
+            for row in rows[table]:
+                value = tuple(row.get(column) for column in key)
+                if value in seen:
+                    bad.add(f"state.{table} repeats {'+'.join(key)} {value!r}")
+                seen.add(value)
+
+
+def _check_state_references(rows: dict[str, list[dict]], bad: _Violations) -> None:
+    """No row may name a parent row that the same `state` does not contain.
+
+    The parent values are collected across every table first rather than as each table is walked, so
+    this does not depend on `_STATE_TABLES_SPEC` happening to list parents before children -- an
+    ordering `_STATE_TABLES_SPEC` does need for its inserts, but which has no business being a second,
+    invisible constraint on where a validation pass may be placed.
+    """
+    known: dict[tuple[str, str], set[object]] = {}
+    for table, keys in _STATE_UNIQUE_KEYS.items():
+        for key in keys:
+            for column in key:
+                known[(table, column)] = {row.get(column) for row in rows[table]}
+    for table, references in _STATE_FOREIGN_KEYS.items():
+        for column, parent, parent_column in references:
+            available = known.get((parent, parent_column), set())
+            for row in rows[table]:
+                value = row.get(column)
+                if value not in available:
+                    bad.add(f"state.{table}.{column} {value!r} names no {parent}.{parent_column}")
 
 
 def ensure_schema() -> None:

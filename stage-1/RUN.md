@@ -67,6 +67,8 @@ gate fails the run over it.
 | POST | `/reservations/{reference}/cancel` | bearer | cancel; 200 even if already cancelled |
 | POST | `/reservation-moves` | bearer | amend 1–8 bookings atomically; requires `Idempotency-Key` |
 | POST | `/_test/reset` | no | replace the fixture |
+| GET | `/_test/export` | no | the whole state as one importable object |
+| POST | `/_test/import` | no | replace everything with an exported object; 204 |
 
 `Idempotency-Key` is required on exactly two paths: `POST /reservations` and `POST /reservation-moves`.
 A first use answers 201; a replay of the same user, method, path and body answers 200 with the original
@@ -75,8 +77,19 @@ body; the same key with a different body answers 409 `idempotency_key_reuse`.
 Errors are always `{"error": {"code": ..., "message": ...}}`. Authentication is
 `Authorization: Bearer <token>`.
 
-## Not implemented
+## Export and import
 
-`GET /_test/export` and `POST /_test/import` — the whole of REQUIREMENTS.md §10 — answer
-`404 not_found`. No route is registered for either. They are listed here so the gap is visible in
-the documentation rather than discovered by a caller.
+```sh
+curl -s localhost:8080/_test/export > state.json
+curl -s -X POST localhost:8080/_test/import -H 'Content-Type: application/json' -d @state.json
+```
+
+The export answers `{"track": "tablekeeper", "format_version": 1, "state": {...}}`. `state` is
+implementation-defined and must be handed back to import unchanged; import replaces the destination
+wholesale — accounts, tokens, fixture configuration, bookings and idempotency receipts alike — and
+answers 204. It carries credentials and session tokens, so it is a test artifact and nothing else.
+
+A body that does not parse is `400 malformed_request`. A missing field, a wrong `track` or
+`format_version`, and a state this service could not have exported are `422 validation_failed`, and
+none of them changes the destination. Repeating an import is 204 and duplicates nothing, and
+`POST /_test/reset` after an import still clears everything, imported state included.
