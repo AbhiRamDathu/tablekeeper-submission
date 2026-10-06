@@ -26,8 +26,9 @@ from zoneinfo import ZoneInfo
 
 from .tz import parse_local, resolve
 
-__all__ = ["database_path", "connect", "transaction", "reset_database", "SCHEMA_TABLES",
-           "InvalidFixture"]
+__all__ = ["database_path", "connect", "transaction", "reset_database", "export_state",
+           "import_state", "EXPORT_TRACK", "EXPORT_FORMAT_VERSION", "STATE_SCHEMA",
+           "SCHEMA_TABLES", "InvalidFixture", "InvalidState"]
 
 #: §3: "IDs are opaque strings of at most 64 characters -- **including IDs in reset fixtures**".
 #: A fixture is the only way restaurants, tables and users come into existence, so a 65-character
@@ -491,8 +492,7 @@ def reset_database(fixture: dict) -> None:
     """
     _zones, instants = _validated_fixture(fixture)
     with transaction() as conn:
-        for table in ("idempotency", "reservations", "tokens", "opening_hours",
-                      "tables", "restaurants", "users"):
+        for table in _STATE_DELETE_ORDER:
             conn.execute(f"DELETE FROM {table}")
 
         for user in fixture.get("users", []):
@@ -542,6 +542,243 @@ def reset_database(fixture: dict) -> None:
                  reservation.get("status", "confirmed"),
                  reservation.get("created_at", dt.datetime.now(dt.timezone.utc).isoformat())),
             )
+
+
+# ---- §10: export and import -------------------------------------------------------------------
+#
+# §10 asks for one object that leaves the service carrying everything it had, and one endpoint that
+# puts it back. The shape of the work is decided by what §10:167 and §10:175 require and by what
+# they refuse:
+#
+# * **Replacement, not reseeding.** §10:167 says import "is replacement, not merge; repeating it
+#   restores the exported state without duplicating anything", and §10:180 spells out the failure
+#   mode by name: "replacing the state with a fresh fixture does not satisfy this requirement". A
+#   fixture carries plaintext passwords and no receipts, no tokens and no timestamps, so routing
+#   import through `reset_database` would pass every status-code assertion in the section and lose
+#   every identity in it. Hence a row-level dump and a row-level restore, with `reset_database` left
+#   doing what §3.3 asks of it.
+# * **Everything, or nothing.** §10:169-170 requires an invalid envelope to answer 422 "without
+#   changing the destination", so the whole state is validated before a transaction opens, and the
+#   truncate-and-rewrite then shares one `BEGIN IMMEDIATE`. There is no window in which the
+#   destination is half an imported world.
+# * **Opaque to the caller, and a round trip.** §10:165 makes `state` "implementation-defined" but
+#   requires import to accept an unchanged export "produced by this service" -- so `import` reads
+#   back everything `export` wrote, in a deterministic order, with nothing derived on either side.
+
+#: §10:163-164 pins the two fields the envelope carries besides `state`, and §10:165 makes `state`
+#: opaque. These three constants are the whole of what a caller may rely on. They are declared here,
+#: next to the state they wrap, because they are one declaration: an export written with one `track`
+#: and refused by an import reading another is a bug a single source cannot have.
+EXPORT_TRACK = "tablekeeper"
+EXPORT_FORMAT_VERSION = 1
+
+#: Inside `state`, and deliberately *not* one of the three envelope fields. §10 names `track` and
+#: `format_version` and says of `state` only that it is "an implementation-defined JSON object" which
+#: import "must accept unchanged"; it also requires import to answer 422 to "an invalid state",
+#: which needs something to tell valid from invalid. This marker is that something: an object
+#: carrying it is one of our exports, and one that does not is refused before a single row is
+#: written rather than being handed to the table writers and failing there as a `sqlite3` error.
+#:
+#: It is a *marker*, not a compatibility promise. Bumping the schema is a deliberate migration, and
+#: the honest form of one is to teach `_validated_state` the old shape beside the new -- not to
+#: accept a shape and hope.
+STATE_SCHEMA = "tablekeeper/state/1"
+
+#: Every state table, with the columns an export writes and an import reads back, and the JSON type
+#: each column must hold. One structure for all three jobs on purpose: the column list an export
+#: reads, the column list an import writes and the type list a validation pass checks are three views
+#: of the same declaration, and three separate lists would be free to disagree -- an import that
+#: wrote a column the export did not carry would fail at the primary key, inside the transaction,
+#: as a 500 rather than as the 422 §10:169 asks for.
+#:
+#: Iteration order is load-bearing too: this is the order rows are *inserted*, and `tokens`,
+#: `opening_hours` and `tables` all carry a foreign key, so a parent must be written before its
+#: children or the insert fails.
+_STATE_TABLES_SPEC: dict[str, tuple[tuple[str, type], ...]] = {
+    "users": (("id", str), ("email", str), ("password_hash", str), ("display_name", str)),
+    "tokens": (("token", str), ("user_id", str)),
+    "restaurants": (("id", str), ("name", str), ("timezone", str), ("slot_minutes", int),
+                    ("reservation_duration_minutes", int), ("cancellation_cutoff_minutes", int)),
+    "opening_hours": (("restaurant_id", str), ("weekday", str), ("opens", str), ("closes", str),
+                      ("ordinal", int)),
+    "tables": (("restaurant_id", str), ("id", str), ("label", str), ("capacity", int),
+               ("ordinal", int)),
+    "reservations": (("reference", str), ("restaurant_id", str), ("table_id", str),
+                     ("user_id", str), ("starts_at_utc", str), ("starts_at_local", str),
+                     ("party_size", int), ("status", str), ("created_at", str)),
+    "idempotency": (("key", str), ("user_id", str), ("scope", str), ("request_hash", str),
+                    ("status_code", int), ("response_body", str)),
+}
+
+#: The order a replacement empties the tables in, and it is not the insert order reversed by habit
+#: but the order the foreign keys force: every child has to go before its parent, because
+#: `connect()` sets `PRAGMA foreign_keys=ON` and a parent row with a child still pointing at it
+#: cannot be deleted. `reset_database` deletes in this same order, and the two are one invariant
+#: rather than two coincidentally equal literals -- a second list would be free to drift and would
+#: fail as an `IntegrityError` inside the transaction, which for `import` means a rollback on a
+#: correct object.
+_STATE_DELETE_ORDER = ("idempotency", "reservations", "tokens", "opening_hours",
+                       "tables", "restaurants", "users")
+
+#: The order an export reads each table in. Nothing here is a product requirement -- an export may
+#: list its rows in whatever order is cheapest -- but it *is* the reason
+#: `export(import(state)) == state` holds, which §10:165 turns on: import accepts the object
+#: unchanged and the caller may reasonably export it again and compare. Ordering on the primary key
+#: makes that true of a database the service cannot otherwise tell apart from any other.
+#:
+#: `tables` and `opening_hours` are the two that are not keyed by something unique. They are read on
+#: `(parent, ordinal)` first so fixture order survives the round trip, and the remaining columns are
+#: in the ORDER BY only to make the read total: `opening_hours` has no primary key at all, so two
+#: byte-identical rows are representable, and a reader that stopped at `ordinal` could emit them in
+#: either order on two runs over one database.
+_STATE_READ_ORDER = {
+    "users": "id",
+    "tokens": "token",
+    "restaurants": "id",
+    "opening_hours": "restaurant_id, ordinal, weekday, opens, closes",
+    "tables": "restaurant_id, ordinal, id",
+    "reservations": "reference",
+    "idempotency": "key, user_id, scope",
+}
+
+
+class InvalidState(ValueError):
+    """An import object breaks one of the rules §10 states about it.
+
+    Separate from `InvalidFixture` rather than shared with it because the two are judged by
+    different contracts and are reached from different endpoints: §3.3 validates a fixture, §10
+    validates an opaque round trip of this service's own making. A caller cannot author a valid
+    `state` by reading §4, so reusing the fixture's rules here would refuse objects §10 requires
+    import to accept.
+    """
+
+
+def export_state() -> dict:
+    """The whole service state as one JSON value. §10:162-167.
+
+    **One read transaction, so the object is one instant.** §10:167 requires export to be "an
+    atomic, read-only snapshot; subsequent source writes do not change it". WAL gives a deferred
+    transaction its snapshot at the first read, so every table below is read from the same picture of
+    the database -- a reader taking seven separate connections could otherwise be handed a
+    reservation whose receipt had not been written yet, which is precisely the pairing §10:176
+    requires to survive the round trip.
+
+    **Row-level, and every row of every table.** §10:179 lists what has to come back: accounts and
+    their hashed passwords, existing bearer tokens, fixture configuration, reservations and
+    references, and "all completed idempotent request bodies and original responses". The
+    `idempotency` table is therefore exported whole, `request_hash` and `response_body` included --
+    it is what makes a lost-response retry replay rather than book twice after the import, which is
+    the requirement §10 and §11:205 both rest on.
+
+    **The fixture's `ordinal` columns are carried, not recomputed.** `tables` and `opening_hours`
+    order by a position in the fixture array that exists nowhere else, and §8:112 asks for
+    "fixture order" in as many words. An import that re-derived an ordinal from the row order would
+    be guessing at the one thing the export was able to state exactly.
+
+    Nothing here is filtered, hashed or redacted. §10:163 says an export "may contain credentials
+    and session tokens", so `password_hash` and `token` travel, and `track`/`format_version` are how
+    the caller knows it is holding something private.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        state: dict[str, object] = {"schema": STATE_SCHEMA}
+        for table, spec in _STATE_TABLES_SPEC.items():
+            names = [name for name, _ in spec]
+            rows = conn.execute(
+                f"SELECT {', '.join(names)} FROM {table}"
+                f" ORDER BY {_STATE_READ_ORDER[table]}"
+            ).fetchall()
+            state[table] = [{name: row[name] for name in names} for row in rows]
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+    return state
+
+
+def import_state(state: object) -> None:
+    """Replace the entire contents with `state`, atomically. §10:167-180.
+
+    **Validated in full before the transaction opens**, for the reason `_validated_fixture` gives
+    and not because the two share a rule: §10:170 requires 422 "without changing the destination",
+    and a validation failure raised mid-truncate would be a rollback, which leaves the destination
+    intact only by luck of where the walk stopped. Validating first makes the refusal a refusal
+    rather than an accident.
+
+    **Rows are written back verbatim, by column name.** `reference`, `reservation_id`,
+    `created_at`, `starts_at_utc`, token strings and receipt bodies are all copied rather than
+    regenerated, because §10:175 requires identities, statuses and timestamps not to move and
+    §10:178 requires an existing retry to still replay the original response afterwards. An unknown
+    key in a row is ignored and a missing one is refused, both during validation, so nothing a
+    caller adds can reach a column the export did not name.
+
+    **Replacement, so everything after the export is gone.** Every table is emptied before any row
+    is written, which is what removes "all previous destination data and credentials" (§10:180) --
+    including an account created after the export, whose token then resolves to nothing and answers
+    401 rather than authenticating an account that no longer exists.
+    """
+    _validated_state(state)
+    with transaction() as conn:
+        for table in _STATE_DELETE_ORDER:
+            conn.execute(f"DELETE FROM {table}")
+        for table, spec in _STATE_TABLES_SPEC.items():
+            names = [name for name, _ in spec]
+            placeholders = ", ".join("?" * len(names))
+            statement = (f"INSERT INTO {table} ({', '.join(names)}) VALUES ({placeholders})")
+            for row in state[table]:
+                conn.execute(statement, tuple(row[name] for name in names))
+
+
+def _validated_state(state: object) -> None:
+    """Every rule §10 states about a `state`, checked before any transaction is opened.
+
+    Three levels, and which one a bad object fails at is worth stating because it decides the
+    message: a `state` that is not an object, or that does not carry `STATE_SCHEMA`, is refused
+    immediately -- it is not this service's export and there is nothing to walk -- while a row or a
+    column that is the wrong shape is collected, so one object with two bad fields names both.
+
+    The type of every column is checked rather than assumed, and `int` excludes `bool`. That is not
+    fastidiousness: `sqlite3` binds a Python `True` as `1` without complaint, so an export claiming
+    `party_size: true` would be stored as a party of one and answer 201 for a booking nobody asked
+    for. §10:170 says an invalid state is 422, and the only place to notice is before the write.
+
+    Value rules §4 states about a *fixture* are deliberately not restated here. A `state` is not
+    authored by a caller from the specification -- §10 makes it opaque and requires import to accept
+    an unchanged export of ours -- so there is nothing to validate a length against; refusing a
+    state our own export produced would break the round trip the section is built on.
+    """
+    if not isinstance(state, dict):
+        raise InvalidState("state must be a JSON object")
+    if state.get("schema") != STATE_SCHEMA:
+        raise InvalidState(f"state.schema must be {STATE_SCHEMA!r}")
+
+    bad = _Violations()
+    for table, spec in _STATE_TABLES_SPEC.items():
+        rows = state.get(table)
+        if not isinstance(rows, list):
+            raise InvalidState(f"state.{table} must be an array")
+        for index, row in enumerate(rows):
+            path = f"state.{table}[{index}]"
+            if not isinstance(row, dict):
+                raise InvalidState(f"{path} must be an object")
+            for column, kind in spec:
+                value = row.get(column)
+                if kind is int:
+                    # `bool` is an `int` in Python and binds as 1, so it has to be named out.
+                    usable = isinstance(value, int) and not isinstance(value, bool)
+                else:
+                    usable = isinstance(value, str)
+                if not usable:
+                    bad.add(f"{path}.{column} must be "
+                            + ("an integer" if kind is int else "a string"))
+    if bad:
+        raise InvalidState(bad.text)
 
 
 def ensure_schema() -> None:

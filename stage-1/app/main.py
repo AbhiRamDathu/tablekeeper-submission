@@ -124,6 +124,7 @@ _AUTHORED_MESSAGES = (
     auth.CredentialsTaken,
     auth.BadCredentials,
     store.InvalidFixture,
+    store.InvalidState,
     InvalidLocalTime,
     NonExistentLocalTime,
 )
@@ -204,6 +205,58 @@ def reset(request, match):
     return 204, None
 
 
+def export_snapshot(request, match):
+    """§10:162-167 -- 200 with the whole service state as one importable object.
+
+    **Unauthenticated, like reset.** §10:160 says so in as many words, and this handler is
+    registered in `ROUTES` beside `/_test/reset` with no `require_user()` call -- which is the whole
+    of the authentication story on this route. §10:163 warns that an export "may contain
+    credentials and session tokens", so this is a private test artifact and nothing else; the
+    envelope's `track` is what tells the holder that.
+    """
+    return 200, {"track": store.EXPORT_TRACK,
+                 "format_version": store.EXPORT_FORMAT_VERSION,
+                 "state": store.export_state()}
+
+
+def import_snapshot(request, match):
+    """§10:167-170 -- 204, having replaced everything with what the export carried.
+
+    **The envelope is judged here and the state is judged in `store`.** §10:169-170 splits the
+    sentence: "Invalid JSON follows §5; missing fields, wrong track/version or an invalid state give
+    422 `validation_failed` without changing the destination." Three of those four are about three
+    fields this handler owns, and the fourth is about a value whose shape only the storage layer
+    knows. Nothing here writes, and `import_state` validates before it opens its transaction, so
+    every one of these refusals is a refusal and not a rollback.
+
+    **Unparseable JSON is 400, not 422.** §5:47 sends a body that does not parse to
+    `malformed_request`, and §10:169 says exactly that for this endpoint rather than leaving it to
+    §5's table; a body that is not an object is the same case, because §5:47 also puts "a field of
+    the wrong JSON type" there.
+
+    `format_version` is compared with `!=` *and* a `bool` guard, because `True == 1` in Python: a
+    request carrying `"format_version": true` would otherwise be accepted as version 1.
+    """
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("the export object must be a JSON object")
+    for field in ("track", "format_version", "state"):
+        if field not in body:
+            raise _invalid(f"{field} is required")
+    if body["track"] != store.EXPORT_TRACK:
+        raise _invalid(f"track must be {store.EXPORT_TRACK!r}")
+    if body["format_version"] != store.EXPORT_FORMAT_VERSION \
+            or isinstance(body["format_version"], bool):
+        raise _invalid(f"format_version must be {store.EXPORT_FORMAT_VERSION}")
+    try:
+        store.import_state(body["state"])
+    except store.InvalidState as exc:
+        # Same shape as `reset`: `store` writes the sentence with the JSON path of the offending
+        # field, and REQUIREMENTS.md:169 wants the failing path in the 422.
+        raise _invalid(exc) from exc
+    return 204, None
+
+
 def post_signup(request, match):
     user_id = "u_" + secrets.token_hex(6)
     try:
@@ -249,7 +302,7 @@ def get_restaurant(request, match):
         if row is None:
             raise HttpError(404, "not_found", "no such restaurant")
         tables = conn.execute(
-            "SELECT id, label, capacity FROM tables WHERE restaurant_id = ? ORDER BY id",
+            "SELECT id, label, capacity FROM tables WHERE restaurant_id = ? ORDER BY ordinal, id",
             (row["id"],),
         ).fetchall()
         hours = conn.execute(
@@ -304,7 +357,7 @@ def get_availability(request, match):
         if restaurant is None:
             raise HttpError(404, "not_found", "no such restaurant")
         tables = conn.execute(
-            "SELECT id, capacity FROM tables WHERE restaurant_id = ? ORDER BY id",
+            "SELECT id, capacity FROM tables WHERE restaurant_id = ? ORDER BY ordinal, id",
             (restaurant["id"],),
         ).fetchall()
         hours = conn.execute(
@@ -917,6 +970,8 @@ def _reservation_body(row):
 ROUTES = [
     ("GET", re.compile(r"^/health$"), health),
     ("POST", re.compile(r"^/_test/reset$"), reset),
+    ("GET", re.compile(r"^/_test/export$"), export_snapshot),
+    ("POST", re.compile(r"^/_test/import$"), import_snapshot),
     ("POST", re.compile(r"^/auth/signup$"), post_signup),
     ("POST", re.compile(r"^/auth/login$"), post_login),
     ("GET", re.compile(r"^/restaurants$"), list_restaurants),
