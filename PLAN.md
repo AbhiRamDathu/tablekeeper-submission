@@ -1,4 +1,4 @@
-﻿# Plan: Tablekeeper Stage 1 â€” reconciliation and the remaining two units (rev. 3.40)
+﻿# Plan: Tablekeeper Stage 1 â€” reconciliation and the remaining two units (rev. 3.41)
 
 ## Goal
 
@@ -46,6 +46,9 @@ The 1 skip is declared, not silent:
   test_a_batch_receipt_survives_an_export_import_round_trip
     skipped 'GET /_test/export is 404; 205 is unreachable until 10 lands'
 ```
+
+**(rev. 3.41 supersedes this paragraph - the number is now a subset property, see "The invariant,
+restated as a property.")**
 
 Seventeen, not eighteen. `starts_at_rendered_in_restaurant_zone` is declined on the evidence: the
 spec never constrains the offset of `starts_at`, and `17:00:00+00:00` is the same instant as
@@ -513,6 +516,7 @@ New task, **`#12`, owner Test author, runs today**: restore the trigger by break
 underneath a valid fixture so the handler's own SELECT raises, keep the assertion unchanged, and prove
 the guard by putting a real disclosure back and showing the name go red. Fixing this by relaxing the
 assertion to expect 204, or by dropping the name, is forbidden - 17 stays 17.
+*(the "17 stays 17" phrasing is superseded by rev. 3.41; the prohibition stands, the number does not)*
 
 **`occupancy_scoped_by_restaurant` has a stale `blocked_on`.** The gate still reports it as not yet
 provable, blocked on `reset_two_restaurants_sharing_table_ids`, and that blocker has been green since
@@ -529,4 +533,404 @@ before `#12` lands is fine only if nobody reads its green gate name as current.
 
 **Two claims in circulation that the tree contradicts.** The leak is fixed - do not re-open defect 18.
 And the count is **17**, not 18: `Ran 18 tests` is the gate module's test count, which is how 18 keeps
-reappearing.
+reappearing. *(superseded by rev. 3.41: quote the subset property, not either number)*
+
+---
+
+# Rev. 3.41 — Stage 2 priority: the twelve red, ranked by what the tree is missing rather than by what is red
+
+Measured 2026-10-06 on a **clean tree at `3c8eca7`**, `stage-1/` byte-identical to `HEAD`
+(`git status --porcelain stage-1/` empty, `git diff --stat` touches only `.gitignore` and this file).
+Reproduce with
+
+```
+python -m unittest discover -s tests -t .        # from stage-1/
+python docs\board_verify.py
+```
+
+This revision supersedes rev 3.40's unit table for Stage 2 work. It does not restate Stage 1: Units
+0, 1a, 1b, 1d, 2 (product half), 3, 4, 5 (moves contract), 7, 8 and 10 are landed and stay landed,
+and rev. 3.33 remains authoritative for the seventeen names, the citations and the review history.
+
+## Measured baseline
+
+The loader is the only number here that is not a claim about a particular run:
+
+```
+python -c "import unittest; print(unittest.TestLoader().discover('tests',top_level_dir='.').countTestCases())"
+COLLECTED 262
+```
+
+**The suite is nondeterministic on Windows by exactly one test, and the variance is a teardown
+race, not a regression.** Two runs on the same commit, `3c8eca7`, with `stage-1/` clean both times:
+
+```
+Ran 262 - FAILED (failures=13, errors=1, skipped=1)      <- lock race fired
+Ran 261 - FAILED (failures=12, skipped=1)                <- lock race did not fire
+```
+
+Both runs report **the same twelve named red**, one for one, by name. The difference is
+`tests.test_moves.Identity.test_the_creation_time_is_not_regenerated`, which ERRORs in teardown:
+
+```
+PermissionError: [WinError 32] ... Temp\tmp...\test.sqlite
+  via tempfile.TemporaryDirectory.__exit__  <- tests/support.py:160
+```
+
+`store.transaction()` closes correctly -- `ROLLBACK` then `conn.close()`, content anchor
+`def transaction(conn)` in `store.py` -- so this is the `service()` fixture's `TemporaryDirectory`
+racing a lingering handle on Windows only. It is the thirteenth result, and it is also what fails
+the gate's subset assertion. **It will not exist in the graded image.**
+
+So the baseline to quote is the twelve names, never a red count. A red count reported without
+naming which of these two runs it came from is not a measurement. The stable part:
+
+```
+SPEC GATE (Unit 0) - subset assertion
+named defects ............ 23
+  red (named) ............ 12
+  not yet provable ....... 0
+  green .................. 11  auth_returns_display_name, dockerignore_excludes_copied_source,
+                                    idempotency_key_scoped_by_path, json_responses_declare_utf8,
+                                    non_ascii_digits_are_not_decimal_digits,
+                                    occupancy_scoped_by_restaurant, reset_rejects_invalid_fixture,
+                                    reset_spec_shaped_seeded_reservation,
+                                    reset_two_restaurants_sharing_table_ids,
+                                    slot_end_is_absolute_across_transitions, unknown_table_is_404
+declined ................ 1   starts_at_rendered_in_restaurant_zone
+```
+
+## The invariant, restated as a property. No number.
+
+Earlier revisions of this document held the count invariant as a number -- `17 stays 17`,
+`seventeen not eighteen`, `the count is 17, not 18`. **Those lines are superseded.** A number in a
+committed plan is a measurement of one afternoon, and rev. 3.40's `9 red` was found committed and
+stale five commits later. The count did not fail to be true; it stopped being current.
+
+The invariant is a **subset property**, and it is the thing the gate exists to hold:
+
+> Every red test's name is in `NAMED_DEFECTS`, and every name in `NAMED_DEFECTS` has a test.
+
+Both directions are already enforced by `NamedDefectsHaveTests`, so the property is checkable and is
+checked on every run. It says what the count was standing in for.
+
+The counting rules that motivated the old number still hold, restated as intent:
+
+- **Never drop a name to hide a defect.** Deleting a red name is the one failure this gate cannot
+  detect, because the gate's evidence is that name.
+- **Never relax an assertion to accommodate a product bug.** `test_internal_error_message_is_redacted`
+  keeps asserting a redacted message; it is not changed to expect 204.
+- **Registering a genuinely-red defect is the gate working.** The Stage 2 gate landed six names;
+  five arrived green because the product half already shipped, and three are red because `SS10` has no
+  implementation. Registration was not a concession.
+
+What replaced the number, once, as evidence that this is not a retreat: the six names are registered
+in `test_spec_stage1.py` **at `3c8eca7`**, committed by `94f58e1` -- `export_and_import_are_served`,
+`import_is_replacement_and_preserves_receipts`,
+`import_rejects_a_bad_envelope_without_changing_the_destination`,
+`table_ids_are_returned_in_fixture_order`, `json_responses_declare_utf8`,
+`non_ascii_digits_are_not_decimal_digits`. They are kept, they were never in question, and the
+count they added to is not an argument.
+
+The twelve red:
+
+| # | named defect | cluster | § |
+|---|---|---|---|
+| 1 | `export_and_import_are_served` | P0 | §10:162 |
+| 2 | `import_is_replacement_and_preserves_receipts` | P0 | §10:172 |
+| 3 | `import_rejects_a_bad_envelope_without_changing_the_destination` | P0 | §10:169 |
+| 4 | `slot_grid_and_opening_hours_codes` | P1 | §8:126, §8:127 |
+| 5 | `skipped_local_time_is_invalid_local_time` | P1 | §8:130 |
+| 6 | `party_size_wrong_type_is_422` | P1 | §5:57 |
+| 7 | `opening_hours_in_fixture_order` | P2 | §8:101 |
+| 8 | `table_ids_are_returned_in_fixture_order` | P2 | §8:112 |
+| 9 | `restaurants_list_envelope` | P3 | §8:99 |
+| 10 | `list_reservations_envelope_and_desc_order` | P3 | §8:133 |
+| 11 | `reservation_body_has_ends_at_and_created_at` | P3 | §8:123 |
+| 12 | `internal_error_message_is_redacted` | P4 | instrument, not product |
+
+The one declared skip is `test_a_batch_receipt_survives_an_export_import_round_trip`,
+`skipped 'GET /_test/export is 404; SS10:205 is unreachable until SS10 lands'`. It is a thirteenth
+member of the P0 cluster and unskips itself the day P0 lands.
+
+## The ranking criterion, stated so it can be argued with
+
+**Rank by how much of the requirement prose has no implementation at all, not by gate redness.** A
+red name that one query clause fixes is not the same kind of problem as a red name behind which
+there is no code, and putting them in one ordered list by count hides that. This is why P0 and P1
+sit above P2 even though P2 is cheaper.
+
+## What the tree contains, and who is holding it
+
+Recorded because four different baselines circulated in one session and three were wrong. Every
+line here is a command result at `3c8eca7`, not an inference from a plan.
+
+| item | location | state |
+|---|---|---|
+| reset 422 for invalid fixtures | content anchor `except store.InvalidFixture as exc: raise _invalid(exc)` in `def reset` | **committed**, `94f58e1`, green |
+| `JSON_CONTENT_TYPE` + both call sites | content anchor `JSON_CONTENT_TYPE = "application/json; charset=utf-8"` | **committed**, `94f58e1`, green |
+| `_DATE_RE` / `_POSITIVE_INT_RE` ASCII-only | content anchors `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`, `^[0-9]+$` | **committed**, `94f58e1`, green |
+| occupancy scoped by restaurant | content anchor `SELECT starts_at_utc FROM reservations` | **committed**, `c55da5d`, green |
+| the six Stage 2 names | `test_spec_stage1.py`, `NAMED_DEFECTS` | **committed**, `94f58e1` |
+| Unit 2 extraction | `routes/service/errors/validation/render/idempotency` | **does not exist**; `app/` holds `auth`, `intervals`, `main`, `store`, `tz`. 37 SQL statements in `main.py` |
+| `SS10` export/import | no route in the table | **does not exist** |
+| `SS5:59` party_size wrong type | `test_a_field_of_the_wrong_type_is_malformed` asserts 400 | red, product raises `_malformed` |
+
+Three consequences that are not negotiable and are the reason the count was never the real problem:
+
+1. **Nothing is dirty under `stage-1/`.** Reports of uncommitted app fixes, of a changed
+   `test_spec_stage2.py`, and of a 400-second window with unnamed failures were all a checkout behind
+   `94f58e1`, not a second writer. Committing an `app/` change from that checkout would revert the
+   entire Stage 2 body. The `NAMED_DEFECTS` tuple has exactly one owner and it has never had two.
+2. **`SS10` has no owner and needs its own lane.** It is nineteen rows and the largest hole in the
+   submission. At last check all four named seats -- planner, test-author, implementer, integrator --
+   were `live=0`. It cannot be a slice of a unit already in flight.
+3. **Unit 2 does not gate the remaining work.** `_validate_booking_fields` has exactly two callers,
+   `_resolve_booking` (create and PATCH) and `post_reservation_moves`, and it never reads
+   `opening_hours`. One insertion covers P1a on all three surfaces, and the grid arithmetic already
+   exists in `get_availability`. A 939-line extraction ahead of that costs a pass to reach a
+   one-insertion fix that turns four absent error codes into real ones. Unit 2 is a reviewability
+   win; the dependency on it is a file-overlap claim, not a logical one. **Sequencing dissent is
+   recorded here, not enforced by me** -- the Integrator's evidence for Unit 2 stands.
+
+Two items are unowned and neither is anyone's current unit:
+
+- **`SS5:16` per-request timeout is unimplemented.** No `settimeout` anywhere in `app/`. The only
+  timeout is `sqlite3.connect(timeout=10.0)` and `PRAGMA busy_timeout=10000`, which is a database
+  lock budget, not a request budget.
+- **Root Band scaffolding is untracked and would ship on `git add -A`**: `agent.py` (launcher
+  configured for `stage3_implementer`), `pyproject.toml`, a stub
+  `src/tablekeeper_submission/__init__.py`, a zero-byte `README.md`, `uv.lock`, `.python-version`.
+  `.gitignore` is also dirty and now contains **`agent_config.yaml` twice**; that file is not the
+  Planner's and the duplicate was not committed.
+
+## P0 — export and import does not exist. Not partially: not at all.
+
+`app/main.py:917-931` holds the whole route table. Thirteen routes. `GET /_test/export` and
+`POST /_test/import` are not among them, so both answer 404 through the normal not-found path.
+
+```
+GET  /_test/export -> 404        expected 200
+POST /_test/import -> 404        expected 204
+```
+
+This is the largest unbuilt block in the submission: §10:162-181 is eighteen rows, and §11:205 adds
+the batch-receipt requirement on top. §10:178 carries a warning in the requirements prose itself --
+"replacing state with a fresh fixture does not satisfy this" -- which is a warning about the easiest
+thing to build and get wrong. An implementation that serialises the fixture and replays it on import
+passes every status code in §10 and loses every identity in it.
+
+What must be true, in the order it is easiest to get wrong:
+
+- `state` is an **implementation-defined object that is opaque to the caller** (§10:164). Whatever
+  shape is chosen, import must accept it back **unchanged**. That forbids any normalisation step.
+- Import is **replacement, not merge** (§10:167), and it is **atomic** (§10:165). The reset
+  transaction helper is already `BEGIN IMMEDIATE` with `ROLLBACK`, so the same shape applies.
+- Preserved across the round trip: hashed-password login, **existing bearer tokens**, fixture
+  configuration, reservations, references, completed idempotent request bodies *and their original
+  responses*, successful batch receipts, and a key that failed 4xx stays reusable (§10:172-176).
+  Preserving tokens and receipts is the whole difficulty: it means `users`, `tokens` and the whole
+  `idempotency` table must be inside `state`, not regenerated.
+- Not preserved: anything created after the export must be gone (§10:179).
+- A bad envelope is 422 **and changes nothing** (§10:169-170) -- so validation completes before the
+  destination is touched.
+- Export is a read-only atomic snapshot (§10:171). A concurrent writer must not tear it.
+
+Do **not** put this behind the renderer work. It is independent of it and it is the only unit that
+unblocks the last declared skip.
+
+## P1 — four spec-mandated error codes appear zero times in `app/`, and two rules are not checked at all
+
+Measured across `stage-1/app/*.py` and `stage-1/tests/*.py`:
+
+| token | in `app/` | in `tests/` | requirement |
+|---|---|---|---|
+| `not_on_slot_grid` | **0** | 3 | §8:126 |
+| `outside_opening_hours` | **0** | 3 | §8:127 |
+| `party_exceeds_capacity` | **0** | 0 | §8:128 |
+| `invalid_local_time` | **0** | 4 | §8:130 |
+| `ends_at` | **0** | 23 | §8:123 |
+
+Read that table as two different problems, because they are two different problems.
+
+**P1a — two rules are missing, so the service accepts bookings the spec forbids.** This is wrong
+behaviour, not a wrong code, and it is the reason P1 outranks P2 despite P2 being cheaper.
+`_validate_booking_fields` at content anchor `def _validate_booking_fields(conn, restaurant, table_id,
+starts_at_local, party_size)` checks the table exists, the party is at least 1, the table is big
+enough, and the local time parses. It never consults `opening_hours` and never checks the slot grid.
+Measured consequences, straight from the gate:
+
+```
+19:07 (off the 30-minute grid)   expected 422 not_on_slot_grid         got 201
+12:00 (before opening)           expected 422 outside_opening_hours     got 201
+22:45 (would end after closes)   expected 422 outside_opening_hours     got 201
+17:30 (one slot before opens)    expected 422 not_on_slot_grid         got 201
+```
+
+Four of four. The service is booking off-grid and out-of-hours tables today. The slot-grid rule needs
+`opening_hours` for the weekday plus `slot_minutes`; `get_availability` already computes exactly this
+grid, so the arithmetic exists and has to be lifted into one shared helper rather than written twice.
+
+**P1b — three codes collapse into the generic one.** `party_exceeds_capacity` and
+`invalid_local_time` both go through `_invalid(...)`, i.e. 422 `validation_failed`.
+`party_exceeds_capacity` is the sharper gap: it appears **nowhere at all** -- not in `app/`, and not
+in one single test. It is a §8 requirement row with zero implementation and zero coverage, and the
+shipped test at content anchor `def test_a_table_too_small_for_the_party_is_a_validation_failure`
+actively asserts the *wrong* code for it.
+
+**P1c — one code is the wrong status, and three shipped tests assert the wrong thing.** §5:57 names
+strings and booleans for `party_size` explicitly, so a wrong-type `party_size` is 422
+`validation_failed`. The product raises `_malformed`, i.e. 400. Three shipped tests encode the
+product's current behaviour rather than the specification, and each one has to move in the **same
+commit** as the product fix, by the same owner, or the suite is left red by the correction:
+
+| shipped test | asserts | requirement | named defect that is red |
+|---|---|---|---|
+| `test_a_field_of_the_wrong_type_is_malformed` | 400 | §5:57 -> 422 | `party_size_wrong_type_is_422` |
+| `test_a_nonexistent_local_time_is_rejected` | `validation_failed` | §8:130 -> `invalid_local_time` | `skipped_local_time_is_invalid_local_time` |
+| `test_a_table_too_small_for_the_party_is_a_validation_failure` | `validation_failed` | §8:128 -> `party_exceeds_capacity` | **none -- name one** |
+
+This is the first time since rev 3.37 that `main.py:NNN`-style anchors are wrong in a way that
+matters, and the third row is a gap rather than a rotation: the gate has no name for
+`party_exceeds_capacity`, so a fix for it moves no counter at all. That is Test Author work and it is
+the cheapest high-value item in this revision.
+
+Open question 2 from rev 3.39 is now **moot on the evidence**: three separate tests and one gate name
+all resolve to 422, and §5:57 names strings explicitly, which is what makes it specific rather than
+general. The 400 reading is not defensible against its own gate name.
+
+## P2 — the fixture ordinal exists, is populated, is indexed, and nothing reads it
+
+The schema is already finished for this. `store.py` writes `ordinal` at insert
+(`INSERT INTO opening_hours (restaurant_id, weekday, opens, closes, ordinal)` and
+`INSERT INTO tables (restaurant_id, id, label, capacity, ordinal)`), indexes it
+(`tables_by_ordinal` UNIQUE, `opening_hours_by_ordinal`), and backfills it for pre-ordinal databases
+in `_add_table_fixture_ordinals` and `_add_opening_hours_fixture_ordinals`. Two red named defects and
+four legs between them, and the cause is four query clauses in `main.py`:
+
+```
+"SELECT id, label, capacity FROM tables WHERE restaurant_id = ? ORDER BY id"     -> ORDER BY ordinal
+"SELECT id, capacity FROM tables WHERE restaurant_id = ? ORDER BY id"            -> ORDER BY ordinal
+"... FROM opening_hours ... ORDER BY weekday"                                    -> ORDER BY ordinal
+```
+
+There is no migration to write, no backfill to reason about and no compatibility window to hold
+open. This is the cheapest item in the whole revision and it is a P1-shaped requirement, because
+§8:101 and §8:112 say "in the fixture's shape" and "in fixture order" in as many words.
+
+One trap, already recorded in the Stage 2 gate: the default fixture lists `t_1, t_2, t_3`, which is
+already sorted. So the shipped suite is green and the requirement is still unmet, and a fix that
+only exercises the default fixture would look like it had proved nothing. Exercise `zz_1, aa_1, mm_1`.
+
+## P3 — envelopes, descending order, and two absent response fields
+
+- `GET /restaurants` does not wrap in `{"restaurants":[...]}` (§8:99).
+- `GET /reservations` does not wrap, and orders ascending: the query is
+  `SELECT * FROM reservations WHERE user_id = ? ORDER BY created_at, reference`, which is
+  creation order, and §8:133 asks for `starts_at` **descending** by instant. Those are different
+  orders -- a reservation created earlier can start later -- so this is a real requirement, not a
+  sort-direction typo.
+- `_reservation_body` emits nine keys and omits `ends_at` and `created_at` (§8:123). `slot_end` is
+  imported and used for overlap arithmetic only; the value is computed four times and never
+  rendered once.
+
+Note for the record, not asserted to be a defect: `_reservation_body` sets
+`"reservation_id": row["reference"]`, so the two identifiers are the same string. §8:123 lists them
+as separate fields and §10:174 requires identities to be preserved. An alias satisfies every leg
+the gate writes and keeps the round trip simple. Raising it would need a spec reading nobody has
+asked for; leave it.
+
+## P4 — `internal_error_message_is_redacted` is an instrument defect and must not be "fixed" in the product
+
+Rev 3.39 diagnosed this and the measurement confirms it exactly. The redaction is intact:
+`GENERIC_500_MESSAGE = "an internal error occurred"` and the catch-all returns that fixed string plus
+a correlation id while logging the real text. The *test* has lost its only trigger: it reached a 500
+by resetting with two restaurants sharing table ids, which used to raise
+`UNIQUE constraint failed: tables.id`, and Unit 3 removed the cause, so the reset now returns 204.
+
+```
+status                               expected 500  got 204
+error.code is internal_error         expected internal_error  got None
+message is a fixed string            expected True  got False
+a correlation id is present          expected True  got False
+message leaks none of                PASSED
+```
+
+The last leg is the one this name exists for, and it passes **vacuously**: `forbidden` is a substring
+scan over `message`, and `message` is `""`, so no word matches. A real `str(exc)` restored to the
+catch-all would walk straight through it. Board task `#12` already covers the fix and is unassigned:
+break the schema underneath a valid fixture so the handler's own SELECT raises, keep the assertion
+unchanged, then put a real disclosure back and show the name go red. Relaxing the assertion to expect
+204, or dropping the name, is forbidden -- 23 stays 23.
+
+## Cross-cutting submission risks
+
+0. **Three of the four Stage 2 roles have no live worker, so "work in parallel" cannot happen as
+   instructed.** Measured with `band doctor`, not inferred from a roster:
+
+   ```
+   15 peer(s)
+     test-author               Connected running=true  sessions=3 (live=1)
+     integrator                Connected running=true  sessions=5 (live=1)
+     stage-2-implementer       Connected running=true  sessions=3 (live=2)
+     stage-2-planner           Stopped     running=false sessions=3 (live=0)   <- this session
+     stage-2-test-author       Stopped     running=false sessions=3 (live=0)
+     stage-2-reviewer          Stopped     running=false sessions=3 (live=0)
+     stage-2-integrator        Stopped     running=false sessions=3 (live=0)
+     stage-2-planner-new       Stopped     running=false sessions=2 (live=0)
+     stage-2-implementer-new   Stopped     running=false sessions=2 (live=0)
+     stage-2-test-author-new   Stopped     running=false sessions=2 (live=0)
+     stage-2-reviewer-new      Stopped     running=false sessions=2 (live=0)
+     stage-2-integrator-new    Stopped     running=false sessions=2 (live=0)
+     planner / implementer / reviewer   Failed  running=false  live=0
+   ```
+
+   Only **three** of fifteen peers have a live session, and **none of them is one the owner named
+   except this one**. The three that are live are the Stage 1 `test-author`, the Stage 1
+   `integrator`, and `stage-2-implementer` -- which the owner did not include in the instruction.
+   Every agent-scoped `jam chat` and `jam send` from this session therefore fails with
+   `peer stage-2-planner has no running worker`, which is why rev 3.41 could be published but not
+   delegated.
+
+   The consequence to act on: **a room roster is not evidence that a participant is online.** A
+   roster of 16 in a room with three live workers reads as full staffing and is 3/16. If the owner is
+   waiting on Reviewer and Test Author verdicts, none is coming, and the owner should either restart
+   those workers or route the work to `stage-2-implementer`, which is the only Stage 2 peer up.
+   The rule generalises past this room: **verify `live=` before assigning, and report an unreachable
+   peer as unreachable rather than as silent.**
+
+1. **Per-request timeouts are unimplemented and unevidenced.** §2:16 wants 5 s per request and 10 s
+   for `POST /_test/reset`. There is no socket or handler timeout anywhere in `app/`. Nothing tests
+   it. Report as UNMEASURED, not as passing.
+2. **Docker is still absent.** `Get-Command docker` returns nothing. Board task `#9` stays blocked.
+   The image build, 60 s to healthy (§2:15) and the harness HTTP run are all UNRUN on this host and
+   every report of them must say so.
+3. **The room plan cache is one revision behind the workspace.** `plan show` names rev 3.39; the
+   workspace copy is rev 3.40 until this revision is published. Read the label, never a filename.
+4. **Board drift is now larger than the board suggests.** Measured: 12 tasks, 5 with an assignee, 7
+   without. Of those 7, the plan records #2, #3, #4, #7, #10 and #11 as **landed**, so only #12 is
+   genuinely open work. A reader who takes the board at face value will re-do six finished units.
+   `work room-status` writes only your own assignment, so each owner closes their own row.
+5. **The twelve red are not the whole gap.** The gate is a floor: every failure is a *named* failure,
+   not every requirement a *tested* one. `party_exceeds_capacity` at P1c is the clearest row with no
+   coverage at all, and §10 is eighteen rows with a gate that cannot run until P0 lands.
+
+## What this revision changed
+
+- Established with `band doctor` that **three of fifteen peers are live and none of the three is a
+  Stage 2 role the owner asked to run in parallel**, so the parallel instruction cannot execute and
+  every Reviewer/Test Author/Integrator verdict the owner is waiting on will not arrive. New
+  standing rule: a roster is not evidence of presence, and an unreachable peer is reported as
+  unreachable rather than as silent.
+- Replaced the unit-status table with a four-cluster ranking of the twelve red, criterion stated and
+  open to argument: missing implementation outranks wrong code, which outranks wrong ordering.
+- Established that P0 is a total absence, not a partial, and named the three identities §10:172-176
+  makes hard to preserve.
+- Recorded the `app/`-versus-`tests/` token counts, which turn "these codes are wrong" into "these
+  codes do not exist", and surfaced `party_exceeds_capacity` as a requirement with no test anywhere.
+- Recorded that the fixture ordinal is already stored, indexed and backfilled, so P2 is four query
+  clauses and no migration.
+- Confirmed rev 3.39's P4 diagnosis against the current run and restated the prohibition on fixing it
+  in the product.
+- Named the wrong-type `party_size` question as **moot on the evidence**, superseded by the gate name
+  and the three shipped tests that all resolve to 422.
