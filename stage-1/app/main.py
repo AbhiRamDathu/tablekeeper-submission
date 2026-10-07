@@ -382,41 +382,35 @@ def get_availability(request, match):
     occupancy = [(row["table_id"], dt.datetime.fromisoformat(row["starts_at_utc"])) for row in booked]
 
     slots = []
-    for window in hours:
-        start_minutes = minutes_of(window["opens"])
-        close_minutes = minutes_of(window["closes"])
-        cursor = start_minutes
-        while cursor + duration <= close_minutes:
-            label = format_minutes(cursor)
-            naive = parse_local(f"{day.isoformat()}T{label}")
-            try:
-                starts = resolve(naive, zone)
-            except NonExistentLocalTime:
-                # The wall time is skipped by a clock change; there is no such slot to offer.
-                cursor += step
+    for cursor in _slot_starts(hours, step, duration):
+        label = format_minutes(cursor)
+        naive = parse_local(f"{day.isoformat()}T{label}")
+        try:
+            starts = resolve(naive, zone)
+        except NonExistentLocalTime:
+            # The wall time is skipped by a clock change; there is no such slot to offer.
+            continue
+        ends = slot_end(starts, duration)
+
+        free = []
+        for table in tables:
+            if table["capacity"] < party_size:
                 continue
-            ends = slot_end(starts, duration)
+            taken = any(
+                table_id == table["id"] and overlaps(starts, ends, other_start, other_end)
+                for table_id, other_start in occupancy
+                for other_end in [slot_end(other_start, duration)]
+            )
+            if not taken:
+                free.append(table["id"])
 
-            free = []
-            for table in tables:
-                if table["capacity"] < party_size:
-                    continue
-                taken = any(
-                    table_id == table["id"] and overlaps(starts, ends, other_start, other_end)
-                    for table_id, other_start in occupancy
-                    for other_end in [slot_end(other_start, duration)]
-                )
-                if not taken:
-                    free.append(table["id"])
-
-            # A slot with no free table still appears, carrying an empty list: the restaurant is
-            # open and the grid exists, there is simply nothing left to seat at that moment.
-            slots.append({
-                "starts_at_local": f"{day.isoformat()}T{label}",
-                "starts_at": format_instant(starts),
-                "available_table_ids": free,
-            })
-            cursor += step
+        # A slot with no free table still appears, carrying an empty list: the restaurant is
+        # open and the grid exists, there is simply nothing left to seat at that moment.
+        slots.append({
+            "starts_at_local": f"{day.isoformat()}T{label}",
+            "starts_at": format_instant(starts),
+            "available_table_ids": free,
+        })
 
     return 200, {"restaurant_id": restaurant["id"], "date": params["date"],
                  "party_size": party_size, "slots": slots}
@@ -528,6 +522,68 @@ def _enforce_cutoff(row, restaurant, what):
         raise HttpError(409, "cutoff_passed", f"too close to the start to {what}")
 
 
+def _slot_starts(hours, step, duration):
+    """The wall-clock minute-of-day of every slot one day's windows offer as a booking start.
+
+    **The single copy of the grid arithmetic** (§4:101, §8:117-118): a slot is
+    `opens + k * slot_minutes` for every step such that `slot + duration <= closes`, window by
+    window in fixture order. `get_availability` lists these to build its answers and
+    `_assert_within_opening_slot` validates a single requested start against them, so the two
+    booking questions cannot drift apart the day `slot_minutes` stops being 30.
+    """
+    starts = []
+    for window in hours:
+        cursor = minutes_of(window["opens"])
+        closes = minutes_of(window["closes"])
+        while cursor + duration <= closes:
+            starts.append(cursor)
+            cursor += step
+    return starts
+
+
+def _assert_within_opening_slot(conn, restaurant, starts):
+    """§8:126-127 -- the start is an offered slot, or this day's two specific 422 codes.
+
+    Runs on every booking surface -- create and PATCH through `_resolve_booking`, and each move in
+    `POST /reservation-moves` directly -- after the local time has resolved against the
+    restaurant's zone, so `starts` is the correct instant before any grid or hour question is
+    asked. Everything here is a wall-clock question: `weekday`, `%H:%M` and the `opening_hours`
+    strings are all minutes of the restaurant's local day, and the booking's wall-clock span is
+    the absolute duration added to local minutes (§9).
+
+    The two codes overlap when a start is both off-grid and outside the window, and the grid
+    settles the boundary: on 18:00-23:00 with a 90-minute booking, 12:00 is `outside_opening_hours`
+    because `[12:00, 13:30)` does not touch the window at all, while 17:30 -- one slot before
+    opening -- is `not_on_slot_grid` because it runs into the window and fails only on the grid.
+    A weekday without an `opening_hours` row is closed, and booking into it is hours, not grid.
+    """
+    weekday = WEEKDAYS[starts.weekday()]
+    hours = conn.execute(
+        "SELECT opens, closes FROM opening_hours WHERE restaurant_id = ? AND weekday = ?",
+        (restaurant["id"], weekday),
+    ).fetchall()
+    if not hours:
+        raise HttpError(422, "outside_opening_hours",
+                        f"{restaurant['id']} has no opening hours on {weekday}")
+
+    start_minutes = minutes_of(starts.strftime("%H:%M"))
+    step = restaurant["slot_minutes"]
+    duration = restaurant["reservation_duration_minutes"]
+    if start_minutes in set(_slot_starts(hours, step, duration)):
+        return
+
+    for window in hours:
+        opens = minutes_of(window["opens"])
+        closes = minutes_of(window["closes"])
+        if start_minutes + duration <= opens or start_minutes + duration > closes:
+            continue
+        raise HttpError(
+            422, "not_on_slot_grid",
+            f"{starts.strftime('%H:%M')} is not on the {step}-minute slot grid")
+    raise HttpError(422, "outside_opening_hours",
+                    f"{starts.strftime('%H:%M')} is outside this restaurant's opening hours")
+
+
 def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_size):
     """Every check on a requested booking except occupancy. Returns `(table, starts)`.
 
@@ -554,6 +610,7 @@ def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_
         starts = resolve(naive, zone)
     except NonExistentLocalTime as exc:
         raise _invalid(exc) from exc
+    _assert_within_opening_slot(conn, restaurant, starts)
     return table, starts
 
 
