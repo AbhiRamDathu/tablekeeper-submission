@@ -7,3 +7,7 @@ venv/
 *.sqlite-shm
 .pytest_cache/
 runs/
+
+# Local agent/runtime credentials. Never commit these.
+.env
+agent_config.yaml
