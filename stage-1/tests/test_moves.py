@@ -213,10 +213,13 @@ class MovesCase(unittest.TestCase):
         Nothing in the response body exposes `created_at` yet, and :194 says it must not change, so
         the only way to assert that is to read the row.
         """
-        with sqlite3.connect(os.environ["TABLEKEEPER_DB"]) as conn:
+        conn = sqlite3.connect(os.environ["TABLEKEEPER_DB"])
+        try:
             conn.row_factory = sqlite3.Row
             return conn.execute("SELECT created_at FROM reservations WHERE reference = ?",
                                 (reference,)).fetchone()["created_at"]
+        finally:
+            conn.close()
 
     def books(self, client, table_id, at, *, key="k-probe", party_size=2):
         """Can `client` take `table_id` at `at` right now? True when the create got 201."""
