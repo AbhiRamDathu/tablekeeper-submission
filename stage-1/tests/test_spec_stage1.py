@@ -352,13 +352,15 @@ class SpecGate(unittest.TestCase):
         """§8: off-grid → 422 not_on_slot_grid; outside hours or past closes → 422 outside_opening_hours.
 
         Hours are 18:00–23:00 with 30-minute slots and a 90-minute booking, so 19:07 is off-grid,
-        12:00 is before opening, and 22:45 would end at 00:15, past closing.
+        12:00 and 17:30 are before opening, and 22:45 would end at 00:15, past closing. §8:350
+        answers outside_opening_hours for any slot outside the window -- grid is only asked of a
+        start that sits inside it.
         """
         cases = {
             "19:07": ("not_on_slot_grid", "off the 30-minute grid"),
             "12:00": ("outside_opening_hours", "before opening"),
             "22:45": ("outside_opening_hours", "would end after closes"),
-            "17:30": ("not_on_slot_grid", "one slot before opening, so off-grid"),
+            "17:30": ("outside_opening_hours", "before opening, so outside the window"),
         }
         with reset_with([restaurant("r_anker")]) as client:
             legs = []

@@ -562,10 +562,11 @@ def _assert_within_opening_slot(conn, restaurant, starts):
     strings are all minutes of the restaurant's local day, and the booking's wall-clock span is
     the absolute duration added to local minutes (§9).
 
-    The two codes overlap when a start is both off-grid and outside the window, and the grid
-    settles the boundary: on 18:00-23:00 with a 90-minute booking, 12:00 is `outside_opening_hours`
-    because `[12:00, 13:30)` does not touch the window at all, while 17:30 -- one slot before
-    opening -- is `not_on_slot_grid` because it runs into the window and fails only on the grid.
+    The two codes stay apart the way §8:349-350 write them: `not_on_slot_grid` is only asked of a
+    start that sits *inside* the serving window but not on a slot boundary, while any slot that is
+    not inside the window -- before `opens`, or one that would end after `closes` -- is
+    `outside_opening_hours`. So on 18:00-23:00 with a 90-minute booking, 19:07 is `not_on_slot_grid`,
+    and 17:30 (before opening) and 22:45 (ending at 00:15) are both `outside_opening_hours`.
     A weekday without an `opening_hours` row is closed, and booking into it is hours, not grid.
     """
     weekday = WEEKDAYS[starts.weekday()]
@@ -586,7 +587,7 @@ def _assert_within_opening_slot(conn, restaurant, starts):
     for window in hours:
         opens = minutes_of(window["opens"])
         closes = minutes_of(window["closes"])
-        if start_minutes + duration <= opens or start_minutes + duration > closes:
+        if start_minutes < opens or start_minutes + duration > closes:
             continue
         raise HttpError(
             422, "not_on_slot_grid",
