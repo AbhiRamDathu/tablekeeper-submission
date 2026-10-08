@@ -72,10 +72,15 @@ Stage folders are graded against every suite up to their own number, so
 
 | Stage | Folder | Spec implemented | Verified |
 |---|---|---|---|
-| 1 | `stage-1/` | yes | local suite green; container build **unverified — Docker unavailable on this machine** |
-| 2 | `stage-2/` | see `FACTORY.md` | see `FACTORY.md` |
-| 3 | `stage-3/` | see `FACTORY.md` | see `FACTORY.md` |
-| 4 | `stage-4/` | see `FACTORY.md` | see `FACTORY.md` |
+| 1 | `stage-1/` | yes | local suite 272 tests green and official harness 120 passed / 0 failed, measured from a clean clone at `a5b8cdc`; container build **unverified — Docker unavailable on this machine** |
+| 2 | `stage-2/` | **no — landing copy only** | copy is faithful at `2eef2cd`: 272 tests green from inside `stage-2/`. Spec implementation is outstanding work items WI-202..WI-216 |
+| 3 | `stage-3/` | no | folder not created yet |
+| 4 | `stage-4/` | no | folder not created yet |
+
+`python -m harness check --track tablekeeper` currently reports exactly one
+problem: `room.json is missing` (downloadable only from the room's Band menu,
+so it cannot be produced by any seat). `harness run` for stages 3 and 4 has
+not been run because those folders do not exist.
 
 ## Credentials
 
