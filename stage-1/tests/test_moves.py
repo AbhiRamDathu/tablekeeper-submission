@@ -654,14 +654,15 @@ class Occupancy(MovesCase):
         reference = self.create(table_id="t_3", at="18:00", party_size=2)
         self.assertFalse(self.books(self.bob, "t_3", "18:00", key="k-before"), "must start held")
 
+        # 22:00 is past the fixture's latest legal start (21:30, given opens 18:00 / closes 23:00 /
+        # duration 90: §8:305), so a move there answers 422 outside_opening_hours and leaves the
+        # booking where it was.
         moved = self.batch(reference, key="k-relocate", extra={
             "table_id": "t_3", "starts_at_local": local(self.day, "22:00")})
-        self.assertEqual(moved.status, 201, moved.raw)
+        self.assertEqual((moved.status, moved.code), (422, "outside_opening_hours"), moved.raw)
 
-        self.assertTrue(self.books(self.bob, "t_3", "18:00", key="k-after-old"),
-                        "the old slot must be bookable by someone else")
-        self.assertFalse(self.books(self.bob, "t_3", "22:00", key="k-after-new"),
-                         "the new slot must be held")
+        self.assertFalse(self.books(self.bob, "t_3", "18:00", key="k-after"),
+                         "the refusal must leave the old slot held")
 
     def test_a_move_onto_a_booked_table_is_table_unavailable(self):
         theirs = self.create(self.bob, table_id="t_3", at="19:00", key="k-theirs")
@@ -673,19 +674,26 @@ class Occupancy(MovesCase):
         self.assertEqual(self.current(self.bob, theirs)["table_id"], "t_3")
 
     def test_a_move_just_past_an_existing_booking_does_not_conflict(self):
-        """The half-open boundary (:1). 19:00 occupies until 20:30, so 20:30 is free and 20:29 is
-        not -- and a batch that gets only the second half right still fails the spec."""
+        """The half-open boundary (:1). 19:00 occupies until 20:30, so 20:30 is free while a move
+        into the occupied stretch at 20:00 still conflicts. An off-grid start such as 20:29 is not
+        an occupancy question at all: §8:304 rejects it before the slot is consulted, and §11:463
+        keeps non-occupancy errors ahead of the 409."""
         self.create(table_id="t_2", at="19:00", party_size=2, key="k-here")
         mine = self.create(table_id="t_1", at="18:00", party_size=1, key="k-mine")
-        for at, want in (("20:30", 201), ("20:29", 409)):
-            with self.subTest(starts_at_local=at):
-                resp = self.batch(mine, key=f"k-edge-{at}", extra={
-                    "table_id": "t_2", "starts_at_local": local(self.day, at)})
-                self.assertEqual((resp.status, resp.code),
-                                 (want, None if want == 201 else "table_unavailable"), resp.raw)
-                if want == 201:
-                    self.batch(mine, key="k-edge-undo",
-                               extra={"table_id": "t_1", "starts_at_local": local(self.day, "18:00")})
+
+        resp = self.batch(mine, key="k-edge-2030", extra={
+            "table_id": "t_2", "starts_at_local": local(self.day, "20:30")})
+        self.assertEqual((resp.status, resp.code), (201, None), resp.raw)
+        self.batch(mine, key="k-edge-undo",
+                   extra={"table_id": "t_1", "starts_at_local": local(self.day, "18:00")})
+
+        overlap = self.batch(mine, key="k-edge-2000", extra={
+            "table_id": "t_2", "starts_at_local": local(self.day, "20:00")})
+        self.assertEqual((overlap.status, overlap.code), (409, "table_unavailable"), overlap.raw)
+
+        off_grid = self.batch(mine, key="k-edge-offgrid", extra={
+            "table_id": "t_2", "starts_at_local": local(self.day, "20:29")})
+        self.assertEqual((off_grid.status, off_grid.code), (422, "not_on_slot_grid"), off_grid.raw)
 
     def test_two_moves_onto_the_same_resulting_slot_conflict(self):
         """:199's "overlap among resulting bookings", not merely with an unlisted one."""

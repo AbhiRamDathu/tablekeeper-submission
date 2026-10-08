@@ -282,19 +282,19 @@ class ReleasedAndReservedTogether(PatchCase):
     """:141 -- the old slot is released and the new one reserved in the same breath."""
 
     def test_a_moved_booking_frees_its_old_slot_and_takes_its_new_one(self):
-        # A four-hour gap, because a booking runs 90 minutes: adjacent slots overlap, and a
-        # one-step move would confound "released" with "still occupied by the mover".
+        # 22:00 is past the fixture's latest legal start (21:30: opens 18:00 / closes 23:00 /
+        # duration 90, §8:305), so the amendment answers 422 outside_opening_hours and the booking
+        # is left in place -- which is itself the assertion this test now makes.
         reference = self.create(self.ada, "t_3", "18:00")
         self.assertEqual(self.bob_create("t_3", "18:00", "k-bob-0"), 409,
                          "the slot must start out held")
 
         moved = self.patch(self.ada, reference, {"starts_at_local": local(self.day, "22:00")})
-        self.assertEqual(moved.status, 200)
+        self.assertEqual((moved.status, moved.json["error"]["code"]),
+                         (422, "outside_opening_hours"))
 
-        self.assertEqual(self.bob_create("t_3", "18:00", "k-bob-1"), 201,
-                         "the old slot must be bookable by someone else")
-        self.assertEqual(self.bob_create("t_3", "22:00", "k-bob-2"), 409,
-                         "the new slot must be held")
+        self.assertEqual(self.bob_create("t_3", "18:00", "k-bob-after"), 409,
+                         "the refused move must leave the booking where it was")
 
     def bob_create(self, table_id, at, key):
         resp = self.bob.post("/reservations", json_body={

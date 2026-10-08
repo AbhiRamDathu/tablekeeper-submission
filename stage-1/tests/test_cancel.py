@@ -136,10 +136,15 @@ class SuccessfulCancellation(CancelCase):
 
     def test_only_the_cancelled_booking_stops_blocking_its_slot(self):
         first = self.create(self.ada, "t_3", "18:00", key="k-1")
-        self.create(self.ada, "t_3", "22:00", key="k-2")
+        # 22:00 is past the fixture's latest legal start (21:30: opens 18:00 / closes 23:00 /
+        # duration 90, §8:305), so a booking there answers 422 outside_opening_hours and never
+        # blocks anything.
+        late = self.book(self.ada, "t_3", "22:00", key="k-late")
+        self.assertEqual((late.status, late.code), (422, "outside_opening_hours"))
+        self.create(self.ada, "t_3", "19:30", key="k-2")
         self.cancel(self.ada, first)
         self.assertEqual(self.book(self.bob, "t_3", "18:00", key="k-free").status, 201)
-        self.assertEqual(self.book(self.bob, "t_3", "22:00", key="k-busy").status, 409)
+        self.assertEqual(self.book(self.bob, "t_3", "19:30", key="k-busy").status, 409)
 
 
 class AlreadyCancelled(CancelCase):
