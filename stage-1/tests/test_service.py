@@ -134,7 +134,7 @@ class Authentication(unittest.TestCase):
             for value in stored:
                 self.assertNotIn(ADA["password"], value)
                 self.assertNotIn(BOB["password"], value)
-                self.assertTrue(value.startswith("pbkdf2_sha256$"))
+                self.assertTrue(value.startswith("scrypt$"))
 
     def test_two_users_get_different_hashes_for_the_same_password(self):
         """Both fixtures share one password, so equal hashes would mean no salt."""
@@ -148,6 +148,33 @@ class Authentication(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(len(hashes), 2)
+
+    def test_password_hashes_are_scrypt_and_round_trip(self):
+        """§6:224-225 names scrypt; the stored hash must be scrypt and self-describing."""
+        from app import auth
+
+        stored = auth.hash_password("correct horse")
+        self.assertTrue(stored.startswith("scrypt$"))
+        self.assertTrue(auth.verify_password("correct horse", stored))
+        self.assertFalse(auth.verify_password("wrong horse", stored))
+        self.assertFalse(auth.verify_password("correct horse", "pbkdf2_sha256$120000$00$00"))
+
+    def test_reject_a_hash_that_pushes_scrypt_past_default_memory(self):
+        """A tampered row claiming n=2**30 must verify False, never raise into a 500."""
+        from app import auth
+
+        self.assertFalse(auth.verify_password("correct horse", "scrypt$1073741824$8$1$00$00"))
+
+    def test_verify_password_is_false_on_a_null_or_garbage_stored_value(self):
+        """The users.password_hash column is NOT NULL in the schema, so a NULL row is not storable
+        through this app; the guard is defensive (rows inserted outside this module or schema
+        drift). It must answer False, never raise into a 500. §6 maps unverifiable credentials
+        to 401 unauthenticated."""
+        from app import auth
+
+        self.assertFalse(auth.verify_password("correct horse", None))
+        self.assertFalse(auth.verify_password("correct horse", ""))
+        self.assertFalse(auth.verify_password("correct horse", "scrypt$"))
 
 
 class ProtectedEndpoints(unittest.TestCase):

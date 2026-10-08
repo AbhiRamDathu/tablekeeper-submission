@@ -1,8 +1,9 @@
 """Authentication for Tablekeeper Stage 1 (spec §6).
 
-Passwords are stored as PBKDF2-HMAC-SHA256 with a per-user random salt and compared in constant
-time. `secrets.compare_digest` is used rather than `==` so that a wrong password and a
-nearly-right password are not distinguishable by how long the answer takes.
+Passwords are stored as scrypt with a per-user random salt and compared in constant time.
+`hmac.compare_digest` is used rather than `==` so that a wrong password and a nearly-right
+password are not distinguishable by how long the answer takes. §6 names scrypt explicitly and it is
+in the standard library, so the image needs no dependency to defend the choice.
 
 Validation is split deliberately, because the spec splits it: a field of the wrong JSON *type* is a
 malformed request (400), while a field of the right type holding an unacceptable *value* is a
@@ -19,7 +20,19 @@ import secrets
 __all__ = ["hash_password", "verify_password", "issue_token", "signup", "authenticate",
            "ValidationFailure", "MalformedRequest", "CredentialsTaken", "BadCredentials"]
 
-_PBKDF2_ROUNDS = 120_000
+_SCRYPT_N = 2 ** 14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_SALT_BYTES = 16
+_SCRYPT_DKLEN = 32
+
+#: scrypt's working set is `128 * r * n` bytes -- 16 MiB at these parameters -- and `maxmem` is
+#: passed explicitly rather than left at OpenSSL's default for two reasons. It documents the cost,
+#: and it is the only thing between a tampered `users` row and a memory-exhaustion request, because
+#: `n`, `r` and `p` are read back out of the stored hash: a row claiming `n=2**30` raises instead of
+#: being allocated. 64 MiB is ~4x the requirement, leaving room for the B array and OpenSSL's own
+#: allocations without leaving room for abuse.
+_SCRYPT_MAXMEM = 64 * 1024 * 1024
 
 # `\Z`, not `$`, and the difference is one accepted signup.
 #
@@ -56,21 +69,38 @@ class BadCredentials(Exception):
 
 
 def hash_password(password: str) -> str:
-    """`pbkdf2_sha256$rounds$salt$digest`, all hex, so one column holds everything needed."""
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _PBKDF2_ROUNDS)
-    return f"pbkdf2_sha256${_PBKDF2_ROUNDS}${salt.hex()}${digest.hex()}"
+    """`scrypt$n$r$p$salt$digest`, all hex, so one column holds everything needed to verify it.
+
+    Self-describing in the same sense the old PBKDF2 string was: the parameters travel with the
+    digest, so raising `n` later verifies hashes written under the old one instead of stranding
+    every existing account.
+    """
+    salt = secrets.token_bytes(_SCRYPT_SALT_BYTES)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R,
+                            p=_SCRYPT_P, dklen=_SCRYPT_DKLEN, maxmem=_SCRYPT_MAXMEM)
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, stored: str) -> bool:
-    """Constant-time check against a stored hash. False on any malformed stored value."""
+    """Constant-time check against a stored hash. False on any malformed stored value.
+
+    `dklen` comes from the stored digest rather than from `_SCRYPT_DKLEN`, so the format stays
+    self-describing. A hash whose parameters exceed `_SCRYPT_MAXMEM` raises `ValueError` out of
+    `hashlib` and is caught below, which is the intended outcome: a false, not an allocation.
+
+    `AttributeError` is caught alongside `TypeError`/`ValueError` because a NULL `password_hash`
+    column is reachable (a row inserted outside this module), and `None.split` would otherwise
+    escape as an unhandled 500. §6 says unverifiable credentials are `401 unauthenticated`, and a
+    row with no hash is exactly that.
+    """
     try:
-        algorithm, rounds, salt_hex, digest_hex = stored.split("$")
-        if algorithm != "pbkdf2_sha256":
+        algorithm, n, r, p, salt_hex, digest_hex = stored.split("$")
+        if algorithm != "scrypt":
             return False
-        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(),
-                                        bytes.fromhex(salt_hex), int(rounds))
-    except (ValueError, TypeError):
+        candidate = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
+                                   n=int(n), r=int(r), p=int(p),
+                                   dklen=len(digest_hex) // 2, maxmem=_SCRYPT_MAXMEM)
+    except (AttributeError, TypeError, ValueError):
         return False
     return hmac.compare_digest(candidate.hex(), digest_hex)
 
