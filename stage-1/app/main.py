@@ -376,7 +376,7 @@ def get_availability(request, match):
     if not hours:
         # A weekday with no opening_hours entry is closed: an empty list, not a 404.
         return 200, {"restaurant_id": restaurant["id"], "date": params["date"],
-                     "party_size": party_size, "slots": []}
+                     "timezone": restaurant["timezone"], "party_size": party_size, "slots": []}
 
     zone = ZoneInfo(restaurant["timezone"])
     duration = restaurant["reservation_duration_minutes"]
@@ -415,7 +415,7 @@ def get_availability(request, match):
         })
 
     return 200, {"restaurant_id": restaurant["id"], "date": params["date"],
-                 "party_size": party_size, "slots": slots}
+                 "timezone": restaurant["timezone"], "party_size": party_size, "slots": slots}
 
 
 def list_reservations(request, match):
