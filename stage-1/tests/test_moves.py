@@ -706,6 +706,44 @@ class Occupancy(MovesCase):
         self.assertEqual(self.current(self.ada, first)["table_id"], "t_1")
         self.assertEqual(self.current(self.ada, second)["table_id"], "t_2")
 
+    def test_a_conflict_free_swap_succeeds(self):
+        """:199 -- a swap checked against the *before* world looks like a collision, because each
+        mover is still sitting in the slot the other is about to take. What matters is the overlap
+        among the *resulting* bookings, and after the swap A occupies t_3 while B occupies t_2, so
+        nothing overlaps and the batch answers 201 instead of the false 409 a live-table check
+        gives at the very first item."""
+        a = self.create(table_id="t_2", at="19:00", party_size=2, key="k-swap-a")
+        b = self.create(table_id="t_3", at="19:00", party_size=2, key="k-swap-b")
+        resp = self.moves([
+            {"reference": a, "table_id": "t_3"},
+            {"reference": b, "table_id": "t_2"},
+        ], key="k-swap")
+        self.assertEqual((resp.status, resp.code), (201, None), resp.raw)
+        # Every slot now holds exactly its new owner; nothing was left half-applied.
+        self.assertEqual(self.current(self.ada, a)["table_id"], "t_3")
+        self.assertEqual(self.current(self.ada, b)["table_id"], "t_2")
+        self.assertFalse(self.books(self.bob, "t_3", "19:00", key="k-swap-a-new"),
+                         "A must hold its new slot")
+        self.assertFalse(self.books(self.bob, "t_2", "19:00", key="k-swap-b-new"),
+                         "B must hold its new slot")
+
+    def test_a_swap_whose_resulting_bookings_overlap_is_refused(self):
+        """:199 -- the batch is all-or-nothing, so a *resulting* overlap among the swapped-in
+        bookings answers 409 and rolls the earlier item back with the later one."""
+        a = self.create(table_id="t_2", at="19:00", party_size=2, key="k-swa-1")
+        b = self.create(table_id="t_3", at="18:00", party_size=2, key="k-swa-2")
+        resp = self.moves([
+            {"reference": a, "table_id": "t_3", "starts_at_local": local(self.day, "19:00")},
+            {"reference": b, "table_id": "t_3", "starts_at_local": local(self.day, "18:00")},
+        ], key="k-swa-both")
+        # A occupies [19:00, 20:30); B occupies [18:00, 19:30). They share [19:00, 19:30), so the
+        # destinations collide and the answer is 409 regardless of which item is walked first.
+        self.assertEqual((resp.status, resp.code), (409, "table_unavailable"), resp.raw)
+        self.assertEqual(self.current(self.ada, a)["table_id"], "t_2")
+        self.assertEqual(self.current(self.ada, a)["starts_at_local"], local(self.day, "19:00"))
+        self.assertEqual(self.current(self.ada, b)["table_id"], "t_3")
+        self.assertEqual(self.current(self.ada, b)["starts_at_local"], local(self.day, "18:00"))
+
     def test_an_unchanged_listed_booking_retains_its_occupancy(self):
         """:200 -- proven by booking, since "retains its occupancy" is a claim about a second caller."""
         held = self.create(table_id="t_2", at="19:00", party_size=2, key="k-held")

@@ -844,9 +844,12 @@ def post_reservation_moves(request, match):
 
     1. every item's non-occupancy checks, walked in input order -- 404, cancelled, the shared
        restaurant, the cutoff, then the ordinary amendment field rules;
-    2. then occupancy, also in input order, applying each item as it clears so the next item is
-       checked against its predecessor's *destination*. That is what makes :199's "overlap among
-       resulting bookings" fall out without a second copy of the conflict logic.
+    2. then occupancy, also in input order, but judged against the batch's *resulting* state:
+       each destination is compiled and checked against the destinations already fixed and against
+       the bookings that are not moving. That is what makes :199's "overlap among resulting
+       bookings or with an unlisted booking" fall out without a second copy of the conflict
+       logic -- and it is what lets a conflict-free swap succeed, which a live-table check would
+       wrongly refuse while the swap's partner still sits in its own old slot.
 
     Nothing here commits until every item is through both passes, so no caller can observe a
     half-applied batch and a failure leaves reservations and occupancy untouched, as :201 requires.
@@ -944,10 +947,34 @@ def post_reservation_moves(request, match):
                                                      starts_at_local, party_size)
             planned.append((reference, table, starts, table_id, starts_at_local, party_size))
 
-        # Pass two: occupancy, in input order, each item applied as it clears.
+        # Pass two: occupancy against the batch's *resulting* state, not the pre-batch one.
+        # Checking each item against the live table would refuse a conflict-free swap: the first
+        # mover collides with its partner, which still sits in the slot it is about to vacate.
+        # So every destination is compiled first, then each item is checked against the
+        # destinations already fixed by earlier items -- :199's "overlap among resulting bookings",
+        # which is also how an item that stays put keeps holding (:200, by colliding with anyone
+        # who tries to take its slot) -- and against every booking that is not moving (:199 "or
+        # with an unlisted booking"). The checks run in input order, so :197's ordering is
+        # preserved for occupancy conflicts as well as non-occupancy errors.
+        listed = [reference for reference, _table, _starts, _table_id, _starts_at_local,
+                  _party_size in planned]
+        in_clause = ", ".join("?" for _ in listed)
+        compiled = []
         results = []
         for reference, table, starts, table_id, starts_at_local, party_size in planned:
-            _assert_slot_free(conn, restaurant, table, starts, exclude_reference=reference)
+            ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+            for other_table, other_starts, other_ends in compiled:
+                if other_table["id"] == table["id"] and overlaps(
+                        starts, ends, other_starts, other_ends):
+                    raise HttpError(409, "table_unavailable", "that table is already booked")
+            clash = ("SELECT starts_at_utc FROM reservations"
+                     " WHERE table_id = ? AND restaurant_id = ? AND status != 'cancelled'"
+                     f" AND reference NOT IN ({in_clause})")
+            for row in conn.execute(clash, (table["id"], restaurant["id"], *listed)).fetchall():
+                other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
+                if overlaps(starts, ends, other_start,
+                            slot_end(other_start, restaurant["reservation_duration_minutes"])):
+                    raise HttpError(409, "table_unavailable", "that table is already booked")
             # `reference`, `status`, `user_id` and `created_at` are deliberately absent from the SET
             # list: §11:194 keeps identity, owner and creation time unchanged through a move.
             conn.execute(
@@ -959,6 +986,7 @@ def post_reservation_moves(request, match):
             moved = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                  (reference,)).fetchone()
             results.append(_reservation_body(moved, restaurant))
+            compiled.append((table, starts, ends))
 
         created = (201, {"reservations": results})
         conn.execute(
