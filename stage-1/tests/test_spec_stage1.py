@@ -82,6 +82,7 @@ NAMED_DEFECTS = (
     "occupancy_scoped_by_restaurant",
     "opening_hours_in_fixture_order",
     "slot_end_is_absolute_across_transitions",
+    "starts_at_rendered_in_restaurant_zone",
     "internal_error_message_is_redacted",
     # Stage 2. The names live here, next to the gate that reads them, and their test methods live in
     # `tests/test_spec_stage2.py` -- a second tuple that could drift is a second source of truth, and
@@ -110,16 +111,7 @@ BLOCKED = {
 }
 
 # Names the plan proposed and this gate declines to carry, with the reason on the record.
-DECLINED = {
-    "starts_at_rendered_in_restaurant_zone": (
-        "the spec never constrains the offset of `starts_at`: §3.4 requires RFC 3339 with an "
-        "explicit offset and +00:00 is one, §8 lists `starts_at_local` and `starts_at` as distinct "
-        "fields of the same slot (so they carry different information), and the observed "
-        "17:00:00+00:00 is the same instant as 19:00+02:00. Asserting restaurant-zone rendering "
-        "would be the gate's own opinion, not the spec's. Plan rev. 3.11 authorises dropping the "
-        "name when the spec is silent, and the count becomes 17."
-    ),
-}
+DECLINED = {}
 
 
 class _Reset:
@@ -265,6 +257,32 @@ class SpecGate(unittest.TestCase):
             if "ends_at" in ends:
                 legs.append((f"{fall} 01:30 + 90 absolute minutes ends at local 02:00, not 03:00",
                              f"{fall}T02:00", ends["ends_at"][:16]))
+        assert_all(self, legs)
+
+    def test_starts_at_rendered_in_restaurant_zone(self):
+        """§8:297 and §8:338-339 -- `starts_at` carries the restaurant's offset, not UTC.
+
+        The worked examples render a local 19:00 in September Berlin as "19:00:00+02:00": the wall
+        time with the zone's offset, which is the same instant a UTC rendering would have called
+        "17:00:00+00:00". Both seasons are asserted so a hard-coded summer offset cannot pass.
+        """
+        cases = (("2026-06-01", "+02:00"), ("2026-01-15", "+01:00"))
+        legs = []
+        for date, expected in cases:
+            with reset_with([restaurant("r_anker", timezone="Europe/Berlin")]) as client:
+                created = client.post("/reservations", json_body={
+                    "restaurant_id": "r_anker", "table_id": "t_2",
+                    "starts_at_local": f"{date}T19:00", "party_size": 2},
+                    headers={"Idempotency-Key": f"zone-{date}"}).json or {}
+                if "starts_at" in created:
+                    legs.append((f"{date} create renders the restaurant offset",
+                                 expected, created["starts_at"][-6:]))
+                listed = client.get("/reservations").json or {}
+                rows = listed.get("reservations", []) if isinstance(listed, dict) else []
+                mine = next((r for r in rows if r.get("starts_at")), None)
+                if mine:
+                    legs.append((f"{date} list renders the restaurant offset",
+                                 expected, mine["starts_at"][-6:]))
         assert_all(self, legs)
 
     def test_list_reservations_envelope_and_desc_order(self):

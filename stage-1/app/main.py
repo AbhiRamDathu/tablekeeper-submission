@@ -1066,8 +1066,8 @@ def _reservation_body(row, restaurant=None):
         finally:
             conn.close()
     starts = dt.datetime.fromisoformat(row["starts_at_utc"])
-    ends = slot_end(starts, restaurant["reservation_duration_minutes"]).astimezone(
-        ZoneInfo(restaurant["timezone"]))
+    zone = ZoneInfo(restaurant["timezone"])
+    ends = slot_end(starts, restaurant["reservation_duration_minutes"]).astimezone(zone)
     created = dt.datetime.fromisoformat(row["created_at"])
     return {
         "reference": row["reference"],
@@ -1076,7 +1076,12 @@ def _reservation_body(row, restaurant=None):
         "table_id": row["table_id"],
         "user_id": row["user_id"],
         "starts_at_local": row["starts_at_local"],
-        "starts_at": format_instant(starts),
+        # §8's worked examples render both starts_at and ends_at in the restaurant's zone -- a
+        # local 19:00 in September's Berlin is "19:00:00+02:00" (§8:297, §8:338-339), the wall time
+        # with its offset, not the same instant read as 17:00:00+00:00 at UTC. UTC is reserved for
+        # created_at, whose example carries +00:00 (§8:340). ends_at is already zone-rendered;
+        # starts_at must match so both fields of the same booking read in one zone.
+        "starts_at": format_instant(starts.astimezone(zone)),
         "ends_at": format_instant(ends),
         "party_size": row["party_size"],
         "status": row["status"],
