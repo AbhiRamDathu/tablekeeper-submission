@@ -489,10 +489,16 @@ def post_reservation(request, match):
             return 200, replay
 
         for field in ("restaurant_id", "table_id", "starts_at_local"):
-            if not isinstance(body.get(field), str):
+            if field not in body:
+                raise _invalid(f"{field} is required")
+            if not isinstance(body[field], str):
                 raise _malformed(f"{field} must be a string")
-        if not isinstance(body.get("party_size"), int) or isinstance(body.get("party_size"), bool):
-            raise _malformed("party_size must be an integer")
+        if "party_size" not in body:
+            raise _invalid("party_size is required")
+        if not isinstance(body["party_size"], int) or isinstance(body["party_size"], bool):
+            # §5:172-174: invalid `party_size` values -- including strings and booleans -- are
+            # 422 validation_failed, the specific field rule beating §5:48's generic wrong-type 400.
+            raise _invalid("party_size must be an integer")
 
         created = _create_reservation(conn, body, user["id"])
         conn.execute(
@@ -717,7 +723,9 @@ def patch_reservation(request, match):
             raise _malformed(f"{field} must be a string")
     if "party_size" in body and (not isinstance(body["party_size"], int)
                                  or isinstance(body["party_size"], bool)):
-        raise _malformed("party_size must be an integer")
+        # §5:172-174: `party_size` strings and booleans are 422 validation_failed; the other two
+        # amendment fields keep §5:48's generic wrong-type 400.
+        raise _invalid("party_size must be an integer")
 
     reference = match.group("reference")
     conn = store.connect()

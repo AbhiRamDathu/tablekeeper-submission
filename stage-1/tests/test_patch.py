@@ -165,8 +165,10 @@ class SameValidationAsCreate(PatchCase):
         for value in ("3", 3.0, True, None):
             with self.subTest(party_size=value):
                 resp = self.patch(self.ada, reference, {"party_size": value})
+                # §5:172-174 carves `party_size` out of that rule: strings and booleans (and nulls
+                # and floats) are 422 validation_failed. `table_id` / `starts_at_local` stay 400.
                 self.assertEqual((resp.status, resp.json["error"]["code"]),
-                                 (400, "malformed_request"))
+                                 (422, "validation_failed"))
 
     def test_a_non_object_body_is_malformed(self):
         reference = self.create(self.ada, "t_2", "19:00", party_size=2)

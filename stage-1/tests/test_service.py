@@ -410,7 +410,9 @@ class Booking(unittest.TestCase):
                 "restaurant_id": w.rid, "table_id": "t_2",
                 "starts_at_local": local(w.date), "party_size": "four"},
                 headers={"Idempotency-Key": "wrong-type"})
-            self.assertEqual((resp.status, resp.code), (400, "malformed_request"))
+            # §5:172-174 names wrong-typed `party_size` as 422 `validation_failed`; only the other
+            # create fields stay 400 under §5:48's generic wrong-type row.
+            self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
 
     def test_an_unknown_table_is_not_found(self):
         """A `table_id` that names no table at this restaurant is 404, not 422.
