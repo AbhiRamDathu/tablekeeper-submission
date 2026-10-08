@@ -694,7 +694,7 @@ def _create_reservation(conn, body, user_id):
     )
     stored = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                           (reference,)).fetchone()
-    return 201, _reservation_body(stored)
+    return 201, _reservation_body(stored, restaurant)
 
 
 def _new_reference() -> str:
@@ -774,7 +774,7 @@ def patch_reservation(request, match):
         raise
     finally:
         conn.close()
-    return 200, _reservation_body(updated)
+    return 200, _reservation_body(updated, restaurant)
 
 
 def cancel_reservation(request, match):
@@ -958,7 +958,7 @@ def post_reservation_moves(request, match):
             )
             moved = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                  (reference,)).fetchone()
-            results.append(_reservation_body(moved))
+            results.append(_reservation_body(moved, restaurant))
 
         created = (201, {"reservations": results})
         conn.execute(
@@ -1024,7 +1024,23 @@ def _validated_moves(body):
     return moves
 
 
-def _reservation_body(row):
+def _reservation_body(row, restaurant=None):
+    # Callers inside a write transaction hand over the restaurant row they already hold; list and
+    # get arrive without one and take the extra lookup. `ends_at` (§8:330-341) is the booking's
+    # absolute end rendered in the restaurant's zone, exactly the value the guest reads off the
+    # grid: slot_end applies the duration in absolute time so a fall-back night that starts at
+    # 01:30 still ends 90 real minutes later (§9), not a wall-clock 90 later.
+    if restaurant is None:
+        conn = store.connect()
+        try:
+            restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                      (row["restaurant_id"],)).fetchone()
+        finally:
+            conn.close()
+    starts = dt.datetime.fromisoformat(row["starts_at_utc"])
+    ends = slot_end(starts, restaurant["reservation_duration_minutes"]).astimezone(
+        ZoneInfo(restaurant["timezone"]))
+    created = dt.datetime.fromisoformat(row["created_at"])
     return {
         "reference": row["reference"],
         "reservation_id": row["reference"],
@@ -1032,9 +1048,11 @@ def _reservation_body(row):
         "table_id": row["table_id"],
         "user_id": row["user_id"],
         "starts_at_local": row["starts_at_local"],
-        "starts_at": format_instant(dt.datetime.fromisoformat(row["starts_at_utc"])),
+        "starts_at": format_instant(starts),
+        "ends_at": format_instant(ends),
         "party_size": row["party_size"],
         "status": row["status"],
+        "created_at": format_instant(created),
     }
 
 
