@@ -152,12 +152,12 @@ class SameValidationAsCreate(PatchCase):
         """Changing the party and the table together is validated against the NEW table."""
         reference = self.create(self.ada, "t_3", "19:00", party_size=2)
         resp = self.patch(self.ada, reference, {"table_id": "t_1", "party_size": 4})
-        self.assertEqual((resp.status, resp.json["error"]["code"]), (422, "validation_failed"))
+        self.assertEqual((resp.status, resp.json["error"]["code"]), (422, "party_exceeds_capacity"))
 
     def test_a_party_that_fits_the_old_table_but_not_the_new_one_is_rejected(self):
         reference = self.create(self.ada, "t_3", "19:00", party_size=6)
         resp = self.patch(self.ada, reference, {"table_id": "t_1"})
-        self.assertEqual((resp.status, resp.json["error"]["code"]), (422, "validation_failed"))
+        self.assertEqual((resp.status, resp.json["error"]["code"]), (422, "party_exceeds_capacity"))
 
     def test_a_wrong_json_type_is_malformed_not_validation_failed(self):
         """§5:48 -- a field of the wrong JSON type is 400, not 422."""

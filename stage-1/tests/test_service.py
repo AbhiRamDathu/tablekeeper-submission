@@ -390,7 +390,7 @@ class Booking(unittest.TestCase):
     def test_a_table_too_small_for_the_party_is_a_validation_failure(self):
         with world() as w:
             resp = book(w, table_id="t_1", party_size=5, key="too-big")
-            self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
+            self.assertEqual((resp.status, resp.code), (422, "party_exceeds_capacity"))
 
     def test_a_nonexistent_local_time_is_rejected(self):
         """2026-03-29T02:30 never happens in Europe/Berlin, so it must not be bookable."""
@@ -402,7 +402,7 @@ class Booking(unittest.TestCase):
                 "restaurant_id": "r_anker", "table_id": "t_2",
                 "starts_at_local": "2026-03-29T02:30", "party_size": 4},
                 headers={"Idempotency-Key": "dst-gap"})
-            self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
+            self.assertEqual((resp.status, resp.code), (422, "invalid_local_time"))
 
     def test_a_field_of_the_wrong_type_is_malformed(self):
         with world() as w:

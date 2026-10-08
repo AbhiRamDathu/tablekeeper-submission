@@ -601,7 +601,8 @@ def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_
     if party_size < 1:
         raise _invalid("party_size must be at least 1")
     if table["capacity"] < party_size:
-        raise _invalid("table is too small for this party")
+        raise HttpError(422, "party_exceeds_capacity",
+                        "party_size exceeds the table's capacity")
 
     try:
         naive = parse_local(starts_at_local)
@@ -611,7 +612,7 @@ def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_
     try:
         starts = resolve(naive, zone)
     except NonExistentLocalTime as exc:
-        raise _invalid(exc) from exc
+        raise HttpError(422, "invalid_local_time", str(exc)) from exc
     _assert_within_opening_slot(conn, restaurant, starts)
     return table, starts
 

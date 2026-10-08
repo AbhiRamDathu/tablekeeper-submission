@@ -71,6 +71,7 @@ NAMED_DEFECTS = (
     "unknown_table_is_404",
     "slot_grid_and_opening_hours_codes",
     "skipped_local_time_is_invalid_local_time",
+    "party_exceeds_capacity",
     "reset_rejects_invalid_fixture",
     "auth_returns_display_name",
     "idempotency_key_scoped_by_path",
@@ -357,6 +358,19 @@ class SpecGate(unittest.TestCase):
                     headers={"Idempotency-Key": f"gap-{value}"})
                 legs.append((f"{value} in the skipped hour",
                              (422, "invalid_local_time"), (resp.status, resp.code)))
+            assert_all(self, legs)
+
+    def test_party_exceeds_capacity(self):
+        """§8: `party_size` over the table's `capacity` → 422 `party_exceeds_capacity`."""
+        with reset_with([restaurant("r_anker")]) as client:
+            legs = []
+            for table_id, party_size in (("t_1", 3), ("t_2", 5), ("t_3", 7)):
+                resp = client.post("/reservations", json_body={
+                    "restaurant_id": "r_anker", "table_id": table_id,
+                    "starts_at_local": "2026-06-01T19:00", "party_size": party_size},
+                    headers={"Idempotency-Key": f"cap-{table_id}"})
+                legs.append((f"{table_id} at {party_size}",
+                             (422, "party_exceeds_capacity"), (resp.status, resp.code)))
             assert_all(self, legs)
 
     def test_reset_rejects_invalid_fixture(self):

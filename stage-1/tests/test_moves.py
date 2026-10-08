@@ -595,7 +595,7 @@ class FieldRules(MovesCase):
         """Validated against the NEW table, as `test_patch.py:151-160` requires of PATCH."""
         reference = self.create(table_id="t_3", at="19:00", party_size=6)
         resp = self.batch(reference, key="k-too-big", extra={"table_id": "t_1"})
-        self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
+        self.assertEqual((resp.status, resp.code), (422, "party_exceeds_capacity"))
         self.assertEqual(self.current(self.ada, reference)["table_id"], "t_3")
 
     def test_a_no_op_item_retains_every_existing_value(self):
@@ -612,7 +612,7 @@ class FieldRules(MovesCase):
         reference = self.create()
         resp = self.batch(reference, key="k-gap",
                           extra={"starts_at_local": f"{next_gap_night()}T02:30"})
-        self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
+        self.assertEqual((resp.status, resp.code), (422, "invalid_local_time"))
         self.assertEqual(self.current(self.ada, reference)["starts_at_local"],
                          local(self.day, "19:00"))
 
@@ -806,7 +806,7 @@ class NothingIsHalfApplied(MovesCase):
         """The occupancy half of :201, proven by booking rather than by reading the row."""
         reference = self.create(table_id="t_3", at="19:00", party_size=2, key="k-subject")
         resp = self.batch(reference, key="k-refuse-occ", extra={"table_id": "t_1", "party_size": 99})
-        self.assertEqual((resp.status, resp.code), (422, "validation_failed"))
+        self.assertEqual((resp.status, resp.code), (422, "party_exceeds_capacity"))
         self.assertFalse(self.books(self.bob, "t_3", "19:00", key="k-probe"),
                          "the refused batch must not have freed the slot")
 
@@ -1008,7 +1008,7 @@ class AcrossDaylightSaving(MovesCase):
         before = f"{night}T01:30"  # an hour that does happen, to prove the move had somewhere to go
         self.one_booking("AAAAAA", "t_2", before, on=night)
         resp = self.batch("AAAAAA", key="k-gap", extra={"starts_at_local": f"{night}T02:30"})
-        self.assertEqual((resp.status, resp.code), (422, "validation_failed"), resp.raw)
+        self.assertEqual((resp.status, resp.code), (422, "invalid_local_time"), resp.raw)
         after = self.current(self.ada, "AAAAAA")
         self.assertEqual(after["starts_at_local"], before)
         self.assertEqual(instant(after["starts_at"]), utc_of(before))
