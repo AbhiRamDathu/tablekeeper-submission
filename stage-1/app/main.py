@@ -457,22 +457,19 @@ def post_reservation(request, match):
     body = request.json_body()
     if not isinstance(body, dict):
         raise _malformed("request body must be a JSON object")
-    for field in ("restaurant_id", "table_id", "starts_at_local"):
-        if not isinstance(body.get(field), str):
-            raise _malformed(f"{field} must be a string")
-    if not isinstance(body.get("party_size"), int) or isinstance(body.get("party_size"), bool):
-        raise _malformed("party_size must be an integer")
 
     request_hash = hashlib.sha256(
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     scope = request.idempotency_scope()
 
-    # The replay check, the conflict check, the insert and the idempotency record all happen in
-    # ONE transaction. That is what makes the §7 burst work: BEGIN IMMEDIATE takes the write lock
-    # up front, so concurrent identical requests serialise and all but the first see the stored
-    # response. Reading the key outside the transaction, as an earlier version did, let every
-    # request in the burst find nothing, race past the conflict check and answer 409.
+    # §7:243-246: "After the body has been parsed as a JSON object and the caller authenticated,
+    # idempotency is resolved before endpoint-specific field validation or current-resource checks.
+    # Thus a used key with a different JSON body returns 409 idempotency_key_reuse even when that
+    # new body would otherwise be invalid." The field-type checks therefore run AFTER the receipt is
+    # looked up -- a spent key answers 409 before a malformed body check can fire -- but inside the
+    # same transaction, so a first-use body that fails them still ROLLBACKs and leaves the key
+    # unspent (§7:254: a key reused after a 4xx failed write is treated as a first use).
     conn = store.connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -490,6 +487,12 @@ def post_reservation(request, match):
             replay = json.loads(stored["response_body"])
             conn.execute("COMMIT")
             return 200, replay
+
+        for field in ("restaurant_id", "table_id", "starts_at_local"):
+            if not isinstance(body.get(field), str):
+                raise _malformed(f"{field} must be a string")
+        if not isinstance(body.get("party_size"), int) or isinstance(body.get("party_size"), bool):
+            raise _malformed("party_size must be an integer")
 
         created = _create_reservation(conn, body, user["id"])
         conn.execute(

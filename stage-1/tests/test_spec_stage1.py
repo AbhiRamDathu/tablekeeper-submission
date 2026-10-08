@@ -72,6 +72,7 @@ NAMED_DEFECTS = (
     "slot_grid_and_opening_hours_codes",
     "skipped_local_time_is_invalid_local_time",
     "party_exceeds_capacity",
+    "key_resolution_outranks_field_validation_on_create",
     "reset_rejects_invalid_fixture",
     "auth_returns_display_name",
     "idempotency_key_scoped_by_path",
@@ -371,6 +372,49 @@ class SpecGate(unittest.TestCase):
                     headers={"Idempotency-Key": f"cap-{table_id}"})
                 legs.append((f"{table_id} at {party_size}",
                              (422, "party_exceeds_capacity"), (resp.status, resp.code)))
+            assert_all(self, legs)
+
+    def test_key_resolution_outranks_field_validation_on_create(self):
+        """§7:243-246 -- the key is resolved after the body parses and after auth, before field checks.
+
+        The observable consequence of that order is the idempotency contract: a key spent on one
+        body and reused with a *different* body is `409 idempotency_key_reuse`, whatever that
+        second body is. Validating fields before the key is read makes a nonsense body answer
+        `400 malformed_request` instead, and the receipt is then reusable -- so a caller who
+        mistypes a field after a timeout can book twice.
+
+        Three legs, and the third is what makes it an ordering defect rather than a validation one:
+        the same broken body on an *unused* key is 400, and the same body replayed on the *spent*
+        key is 409. If validation were simply missing the check, the second leg would pass. If key
+        resolution were simply broken, the third would be 400 too. Only the order explains all three.
+
+        The wrong-typed field is `table_id`, deliberately. `party_size` would have been the obvious
+        choice and the wrong one: §5:57 and §5:48 contradict each other on it, which is why
+        `party_size_wrong_type_is_422` is an open named defect, so asserting either code here would
+        have this test's verdict move with someone else's fix. `table_id` is uncontested -- §5:48
+        makes a non-string 400 `malformed_request` -- so this leg stays true whichever way that
+        other row is settled.
+        """
+        with reset_with([restaurant("r_anker")]) as client:
+            good = {"restaurant_id": "r_anker", "table_id": "t_2",
+                    "starts_at_local": "2026-06-01T19:00", "party_size": 2}
+            wrong_typed = {**good, "table_id": 17}
+            first = client.post("/reservations", json_body=good,
+                                headers={"Idempotency-Key": "k-ordering"})
+            spent_key = client.post("/reservations", json_body=wrong_typed,
+                                    headers={"Idempotency-Key": "k-ordering"})
+            unused_key = client.post("/reservations", json_body=wrong_typed,
+                                     headers={"Idempotency-Key": "k-ordering-unused"})
+            replay = client.post("/reservations", json_body=good,
+                                 headers={"Idempotency-Key": "k-ordering"})
+            legs = [
+                ("first use of a key", (201, None), (first.status, first.code)),
+                ("the same key with a different body is key reuse, whatever that body is",
+                 (409, "idempotency_key_reuse"), (spent_key.status, spent_key.code)),
+                ("the same broken body on an unused key is still malformed",
+                 (400, "malformed_request"), (unused_key.status, unused_key.code)),
+                ("the identical body replayed is 200", (200, None), (replay.status, replay.code)),
+            ]
             assert_all(self, legs)
 
     def test_reset_rejects_invalid_fixture(self):
