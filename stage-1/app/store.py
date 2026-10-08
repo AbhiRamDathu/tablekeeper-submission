@@ -41,6 +41,12 @@ MAX_ID_LENGTH = 64
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _HHMM_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 
+#: §8:344 -- "`reference` is 6 to 12 characters of `A-Z0-9`, unique across all reservations, and
+#: never changes." A fixture seeds reservations, so a fixture reference has to satisfy the same rule
+#: the create path enforces when it mints a reference; accepting anything else at reset hands a
+#: table a row the service could never have produced.
+_REFERENCE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
+
 # Kept apart from the rest of the schema because the migration below has to reissue exactly this
 # statement. A second hand-written copy of the DDL would be free to drift from the table every fresh
 # database gets, and the drift would only show up in an upgraded one.
@@ -358,7 +364,23 @@ def _instant(reservation: dict, zones: dict[str, str], path: str, bad: _Violatio
     fixture may simply omit, and indexing it unguarded is the `KeyError` this docstring is about.
     """
     if "starts_at_utc" in reservation:
-        return _text(reservation["starts_at_utc"], f"{path}.starts_at_utc", bad)
+        instant = _text(reservation["starts_at_utc"], f"{path}.starts_at_utc", bad)
+        if instant is None:
+            return None
+        # A fixture that carries an instant is accepted, but only one that parses as an aware RFC
+        # 3339 instant. Requirement.md:17 makes the downstream parse failures this guarded against
+        # into 5xx responses from `GET /availability` and `GET /reservations`, which no endpoint may
+        # answer; §8's worked example renders `starts_at` with an offset, so a bare wall time is not
+        # an acceptable stand-in either.
+        try:
+            parsed = dt.datetime.fromisoformat(instant)
+        except ValueError:
+            bad.add(f"{path}.starts_at_utc must parse as an RFC 3339 instant")
+            return None
+        if parsed.tzinfo is None:
+            bad.add(f"{path}.starts_at_utc must carry a UTC offset")
+            return None
+        return instant
 
     local = _text(reservation.get("starts_at_local"), f"{path}.starts_at_local", bad)
     if local is None:
@@ -404,28 +426,52 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
     reservation's own `starts_at_local` is not additionally reported as missing, because the
     fixture is already known to be unusable and a second sentence about it would be noise.
 
-    What is deliberately *not* checked: the timezone against the IANA database, and a seeded
-    reservation against its table's capacity or opening hours. §4 constrains neither, a restaurant
-    is allowed a zone this platform cannot resolve (§9 resolves zones when a zone is *read*, not
-    when it is stored), and §4 says a booking is not rejected for being in the past -- so the
-    rules that do exist are the ones checked here.
+    What is deliberately *not* checked: a seeded reservation against its table's capacity or
+    opening hours. §4 constrains neither, and §4 says a booking is not rejected for being in the
+    past -- so the rules that do exist are the ones checked here. A timezone *is* checked against
+    the IANA database and `starts_at_utc` *is* required to parse, because violating either hands
+    the caller a world that 500s the next read instead of a world that serves responses.
     """
     bad = _Violations()
 
+    seen_user_ids: set[str] = set()
+    seen_emails: set[str] = set()
     for index, user in _entries(fixture, "users", bad):
         path = f"users[{index}]"
-        _identifier(user.get("id"), f"{path}.id", bad)
-        _text(user.get("email"), f"{path}.email", bad)
+        user_id = _identifier(user.get("id"), f"{path}.id", bad)
+        if user_id is not None:
+            if user_id in seen_user_ids:
+                bad.add(f"{path}.id duplicates a user already in this fixture")
+            seen_user_ids.add(user_id)
+        email = _text(user.get("email"), f"{path}.email", bad)
+        if email is not None:
+            if email in seen_emails:
+                bad.add(f"{path}.email duplicates a user already in this fixture")
+            seen_emails.add(email)
         _text(user.get("password"), f"{path}.password", bad)
         if "display_name" in user:
             _text(user["display_name"], f"{path}.display_name", bad)
 
     zones: dict[str, str] = {}
+    seen_restaurant_ids: set[str] = set()
     for index, restaurant_row in _entries(fixture, "restaurants", bad):
         path = f"restaurants[{index}]"
         restaurant_id = _identifier(restaurant_row.get("id"), f"{path}.id", bad)
+        if restaurant_id is not None:
+            if restaurant_id in seen_restaurant_ids:
+                bad.add(f"{path}.id duplicates a restaurant already in this fixture")
+            seen_restaurant_ids.add(restaurant_id)
         _text(restaurant_row.get("name"), f"{path}.name", bad)
         timezone = _text(restaurant_row.get("timezone"), f"{path}.timezone", bad)
+        if timezone is not None:
+            # An unresolvable zone is a state the service cannot serve and then 500s from the
+            # endpoints that read it (§9 resolves zones when they are read). The platform has to be
+            # able to resolve the zone at reset time, or every availability/reservation response
+            # for this restaurant is a 500 -- which REQUIREMENTS.md:17 forbids.
+            try:
+                ZoneInfo(timezone)
+            except LookupError:
+                bad.add(f"{path}.timezone must be an IANA zone this platform can resolve")
         if restaurant_id is not None and timezone is not None:
             zones[restaurant_id] = timezone
         _positive(restaurant_row.get("slot_minutes"), f"{path}.slot_minutes", bad)
@@ -436,6 +482,7 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
         if cutoff is not None and cutoff < 0:
             bad.add(f"{path}.cancellation_cutoff_minutes must not be negative")
 
+        seen_tables: set[tuple[str, int]] = set()
         for hours_index, hours in _nested(restaurant_row, "opening_hours", path, bad):
             hours_path = f"{path}.opening_hours[{hours_index}]"
             if hours.get("weekday") not in _WEEKDAYS:
@@ -452,14 +499,25 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
 
         for table_index, table_row in _nested(restaurant_row, "tables", path, bad):
             table_path = f"{path}.tables[{table_index}]"
-            _identifier(table_row.get("id"), f"{table_path}.id", bad)
+            table_id = _identifier(table_row.get("id"), f"{table_path}.id", bad)
+            if restaurant_id is not None and table_id is not None:
+                if (restaurant_id, table_id) in seen_tables:
+                    bad.add(f"{table_path}.id duplicates a table already in this restaurant")
+            seen_tables.add((restaurant_id, table_id))
             _text(table_row.get("label"), f"{table_path}.label", bad)
             _positive(table_row.get("capacity"), f"{table_path}.capacity", bad)
 
     instants: dict[int, str] = {}
+    seen_references: set[str] = set()
     for index, reservation in _entries(fixture, "reservations", bad):
         path = f"reservations[{index}]"
-        _identifier(reservation.get("reference"), f"{path}.reference", bad)
+        reference = _identifier(reservation.get("reference"), f"{path}.reference", bad)
+        if reference is not None:
+            if not _REFERENCE_RE.match(reference):
+                bad.add(f"{path}.reference must be 6 to 12 characters of A-Z0-9")
+            elif reference in seen_references:
+                bad.add(f"{path}.reference duplicates a reservation already in this fixture")
+            seen_references.add(reference)
         restaurant_id = _identifier(reservation.get("restaurant_id"),
                                     f"{path}.restaurant_id", bad)
         known = restaurant_id is not None and restaurant_id in zones

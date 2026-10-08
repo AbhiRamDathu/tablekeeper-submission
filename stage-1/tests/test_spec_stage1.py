@@ -74,6 +74,8 @@ NAMED_DEFECTS = (
     "party_exceeds_capacity",
     "key_resolution_outranks_field_validation_on_create",
     "reset_rejects_invalid_fixture",
+    "reset_rejects_invalid_fixture_references",
+    "reset_rejects_fixtures_that_would_5xx",
     "auth_returns_display_name",
     "idempotency_key_scoped_by_path",
     "restaurants_list_envelope",
@@ -444,6 +446,62 @@ class SpecGate(unittest.TestCase):
             for label, body in cases.items():
                 resp = anon.post("/_test/reset", json_body=body)
                 legs.append((label, (422, "validation_failed"), (resp.status, resp.code)))
+            assert_all(self, legs)
+
+    def test_reset_rejects_invalid_fixture_references(self):
+        """§8:344 -- `reference` is 6 to 12 characters of `A-Z0-9`; a fixture seeds reservations.
+
+        The envelope-level rejection was already green under `reset_rejects_invalid_fixture`; this
+        name isolates the reference-shape dimension, which no shipped test asserted.
+        """
+        bad = {
+            "lowercase": "abcdef",
+            "underscore": "ABCD_1",
+            "too short": "AB1",
+            "too long": "ABCDE0123456789",
+            "only letters and digits but mixed case": "abcdEF",
+        }
+        with reset_with([restaurant("r_anker")]) as client:
+            legs = []
+            for label, reference in bad.items():
+                body = fixture(restaurants=[restaurant("r_anker")],
+                               reservations=[spec_seeded_reservation(reference)])
+                resp = client.post("/_test/reset", json_body=body)
+                legs.append((f"reference {reference!r} ({label})",
+                             (422, "validation_failed"), (resp.status, resp.code)))
+            assert_all(self, legs)
+
+    def test_reset_rejects_fixtures_that_would_5xx(self):
+        """§5:185 -- no 5xx on client errors; the four fixtures that used to answer 500.
+
+        duplicate email and duplicate reference died on a UNIQUE index inside the reset
+        transaction, and an unparseable `starts_at_utc` or an unknown timezone was *accepted*
+        and then 500ed from the first read that resolved it. All four are now refused up front
+        with 422 validation_failed, and the world they were pointed at is left intact.
+        """
+        with reset_with([restaurant("r_anker")]) as client:
+            cases = {
+                "duplicate email": fixture(users=[dict(ADA), dict(ADA)]),
+                "duplicate reference": fixture(
+                    restaurants=[restaurant("r_anker")],
+                    reservations=[spec_seeded_reservation("AAAAAA"),
+                                  spec_seeded_reservation("AAAAAA")]),
+                "unparseable starts_at_utc": fixture(
+                    restaurants=[restaurant("r_anker")],
+                    reservations=[seeded_reservation("AAAAAA", starts_at_utc="not-a-time")]),
+                "unknown timezone": fixture(restaurants=[
+                    restaurant("r_anker", timezone="Mars/Olympus")]),
+            }
+            day = booking_date()
+            before = client.get("/availability", params={
+                "restaurant_id": "r_anker", "date": day, "party_size": 2})
+            legs = []
+            for label, body in cases.items():
+                resp = client.post("/_test/reset", json_body=body)
+                legs.append((label, (422, "validation_failed"), (resp.status, resp.code)))
+                after = client.get("/availability", params={
+                    "restaurant_id": "r_anker", "date": day, "party_size": 2})
+                legs.append((f"{label} leaves the destination intact", before.json, after.json))
             assert_all(self, legs)
 
     def test_auth_returns_display_name(self):

@@ -299,7 +299,10 @@ class Stage2SpecGate(unittest.TestCase):
                      mine.get("reservation_id")),
                     ("the cancellation that happened after the export is undone by the import",
                      "confirmed", mine.get("status")),
-                    ("the amendment that happened after the export is undone by the import", 4,
+                    # The party_size=3 move runs *before* the export, so the exported state carries
+                    # 3 and the import restores a world whose parties are 3 -- "4" reversed the
+                    # ordering of the move and the export.
+                    ("the amendment that happened before the export survives the round trip", 3,
                      mine.get("party_size")),
                     ("starts_at is the instant the export carried", body.get("starts_at"),
                      mine.get("starts_at")),
@@ -336,10 +339,17 @@ class Stage2SpecGate(unittest.TestCase):
                 # SS10:180 -- reset still clears everything, imported state included.
                 fresh = w.anon.post("/_test/reset", json_body=fixture(
                     users=[ADA], restaurants=[restaurant("r_other", name="Other")]))
-                after_reset = Client(w.base_url, w.ada.token).get("/reservations")
+                # The pre-export token is minted against the restaurant the export described; the
+                # reset fixture seeds an entirely different restaurant, so the old token's user
+                # still exists in Ada but its receipts are gone. 401 is the released-shape answer
+                # (SS10:179), and a fresh login rebuilds a working client for the empty world.
+                stale = Client(w.base_url, w.ada.token).get("/reservations")
+                login_after = w.anon.login(ADA["email"], ADA["password"])
+                after_reset = Client(w.base_url, login_after.json["token"]).get("/reservations")
                 rows_after = reservation_rows(after_reset.json)
                 legs += [
                     ("reset after an import answers 204", 204, fresh.status),
+                    ("the pre-export token died with the reset", 401, stale.status),
                     ("and clears the imported bookings too", (200, 0),
                      (after_reset.status, len(rows_after) if rows_after is not None else -1)),
                     ("and clears the imported configuration too", 404,
