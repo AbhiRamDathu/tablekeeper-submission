@@ -194,3 +194,28 @@ The status table in `README.md` is authoritative for which stages exist and what
 has been verified; this file should not be read as a claim that all four stages
 are complete. Anything marked unverified here is unverified because the tool
 that would verify it was unavailable, not because it was attempted and skipped.
+
+---
+
+## 8. Coordination rule
+
+Set by the owner and recorded here so the repository, not a chat log, is the
+source of truth. The work runs as two independent workstreams:
+
+1. **Reviewer — audit and specification findings.** Reads the specification and
+   the code, reports defects. Does not change application code.
+2. **Implementer — remediation.** Applies fixes and builds the remaining stages.
+
+The sequencing is mandatory and applies in both directions:
+
+- The Reviewer reports findings to the shared room board **before** the
+  Implementer makes any non-trivial application change. Findings carry an id, a
+  severity, a specification line citation, a `file:line`, and a one-line
+  reproduction.
+- After the change, the Reviewer **independently re-checks** the resulting code
+  and verifies that each fix actually addresses the reported defect, rather than
+  merely that the suite went green.
+
+The Architect seat coordinates the two, accepts or rejects each handback, and
+records accepted revisions on the board. Neither seat's own report is evidence
+for the other seat's acceptance.
