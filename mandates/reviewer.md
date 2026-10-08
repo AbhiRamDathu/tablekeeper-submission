@@ -1,5 +1,5 @@
 # reviewer
-Harness: opencode
+Harness: OpenCode
 Model: opencode/big-pickle
 
 ## How this seat works
