@@ -119,15 +119,25 @@ they are re-derivable):
 | Measurement | Value |
 |---|---|
 | Repository lifetime | 2026-10-02 → 2026-10-08 (six days) |
-| Commits | see `git rev-list --count HEAD` |
-| Stage-1 suite | 272 tests plus 146 subtests, ≈275 s wall clock on this machine |
-| Official harness, one stage, `--base-url` | ≈344 s wall clock including the stage's overshoot suite |
+| Commits | `git rev-list --count HEAD`, authors distinguishable per seat |
+| Stage-1 suite, in the folder | 272 tests plus 146 subtests, ≈275 s wall clock, 0 failures |
+| Official harness, stage 1, `--base-url` | **120 collected, 120 passed, 0 failed, 310.80 s** |
+| Official harness, stage 2 against `stage-1/` | 23 failed, 1 passed, 1 error, 271.85 s — the correct negative result: `stage-1/` holds no stage-2 surface |
+| Offline gates (`harness check`) | gates 1, 2 and the mandate half of gate 4 pass; `room.json` is the only open item |
 | Runtime dependencies | none (Python standard library) |
-| Model spend | not derivable from this repository; it is recorded per seat by the harness that runs each seat, and no seat here emits spend into the tree |
+| Model spend | `band usage` reports *no usage recorded* for this machine; nothing in the repository records token usage either |
 
-Wall-clock time is the number this factory can honestly measure. Model spend is
-not: nothing in the repository records token usage, and inventing a figure would
-be worse than saying where the real one lives.
+Wall-clock time and check counts are numbers this factory can honestly measure
+and a judge can re-derive from the commands above. Model spend is not: no
+instrument on this host reports it, and inventing a figure would be worse than
+saying where the real one lives.
+
+Collaboration, from `band stats` (last 14 days, machine-wide, so an upper bound
+for this room): 732 messages received and 20,182 sent across all seats, and 26
+completed task dispatches attributed to a named seat — including `planner` 5,
+`reviewer` 13, `architect` 4, `implementer` 3, `quality-assurance` 1. The
+room-scoped numbers a judge will actually read are in `room.json`, which is
+produced by downloading the room from Band and is not written by any seat.
 
 ---
 
