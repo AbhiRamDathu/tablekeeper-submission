@@ -288,7 +288,9 @@ def list_restaurants(request, match):
         ).fetchall()
     finally:
         conn.close()
-    return 200, [_restaurant_body(conn_row, None, []) for conn_row in rows]
+    return 200, {"restaurants": [
+        {"id": row["id"], "name": row["name"], "timezone": row["timezone"]} for row in rows
+    ]}
 
 
 def get_restaurant(request, match):
@@ -421,12 +423,12 @@ def list_reservations(request, match):
     conn = store.connect()
     try:
         rows = conn.execute(
-            "SELECT * FROM reservations WHERE user_id = ? ORDER BY created_at, reference",
+            "SELECT * FROM reservations WHERE user_id = ? ORDER BY starts_at_utc DESC, reference",
             (request.user["id"],),
         ).fetchall()
     finally:
         conn.close()
-    return 200, [_reservation_body(row) for row in rows]
+    return 200, {"reservations": [_reservation_body(row) for row in rows]}
 
 
 def get_reservation(request, match):

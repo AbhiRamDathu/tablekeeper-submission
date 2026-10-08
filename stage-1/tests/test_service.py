@@ -347,7 +347,7 @@ class Booking(unittest.TestCase):
                 w.ada.post("/reservations", json_body=body,
                            headers={"Idempotency-Key": "apply-once"})
             listed = w.ada.get("/reservations").json
-            self.assertEqual(len(listed), 1)
+            self.assertEqual(len(listed["reservations"]), 1)
 
     def test_reusing_a_key_with_a_different_body_is_rejected(self):
         with world() as w:
@@ -378,8 +378,8 @@ class Booking(unittest.TestCase):
             self.assertEqual(
                 w.bob.post("/reservations", json_body=bob_body,
                            headers={"Idempotency-Key": "shared"}).status, 201)
-            self.assertNotEqual(w.ada.get("/reservations").json[0]["reference"],
-                                w.bob.get("/reservations").json[0]["reference"])
+            self.assertNotEqual(w.ada.get("/reservations").json["reservations"][0]["reference"],
+                                w.bob.get("/reservations").json["reservations"][0]["reference"])
 
     def test_double_booking_the_same_table_is_a_conflict(self):
         with world() as w:
@@ -478,7 +478,7 @@ class Concurrency(unittest.TestCase):
 
             self.assertEqual(statuses.count(201), 1, statuses)
             self.assertEqual(statuses.count(200), 9, statuses)
-            self.assertEqual(len(w.ada.get("/reservations").json), 1)
+            self.assertEqual(len(w.ada.get("/reservations").json["reservations"]), 1)
 
 
 if __name__ == "__main__":
