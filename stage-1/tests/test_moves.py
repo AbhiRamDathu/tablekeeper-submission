@@ -54,6 +54,7 @@ from tests.support import (
     ADA,
     BOB,
     Client,
+    assert_all,
     booking_date,
     fixture,
     local,
@@ -1683,16 +1684,56 @@ class UpgradeKeepsReceipts(unittest.TestCase):
 class BatchReceiptsSurviveExportImport(unittest.TestCase):
     """:205 -- export/import preserves successful batch receipts and the resulting bookings.
 
-    Skipped rather than written, and the reason is the point: `GET /_test/export` and
-    `POST /_test/import` are still 404, so the only way to express this assertion today is to pin the
-    404 as the expectation. A test that locks a defect in place is worse than a missing test, because
-    it reads as coverage. This class is here so the gap is visible in the suite rather than only in a
-    review.
+    Written once §10 landed instead of skipped: the class began life pinned to the old
+    `GET /_test/export` 404, which is exactly the "a test that locks a defect in" failure — it
+    read as coverage while the round trip was unreachable. The 404 is long gone, and this is the
+    assertion that is now real, on a state that could not exist through the API: the export
+    happened after the batch moved the booking, the cancel happened after the export, and the
+    import restores the moved world. The receipt still replays 200 with its original body.
     """
 
-    @unittest.skip("GET /_test/export is 404; :205 is unreachable until §10 lands")
     def test_a_batch_receipt_survives_an_export_import_round_trip(self):
-        raise NotImplementedError
+        with service() as base_url:
+            anon = Client(base_url)
+            seeded = fixture()
+            reset = anon.post("/_test/reset", json_body=seeded)
+            self.assertEqual(204, reset.status, f"reset failed: {reset!r}")
+            ada = anon.authenticate(ADA["email"], ADA["password"])
+            rid = seeded["restaurants"][0]["id"]
+            day = booking_date()
+
+            created = ada.post("/reservations", json_body={
+                "restaurant_id": rid, "table_id": "t_2",
+                "starts_at_local": local(day, "19:00"), "party_size": 2},
+                headers={"Idempotency-Key": "ki-batch-create"})
+            reference = created.json["reference"]
+            batch = ada.post(MOVES, json_body={"moves": [
+                {"reference": reference, "table_id": "t_3"}]},
+                headers={"Idempotency-Key": "ki-batch-roundtrip"})
+            self.assertEqual(201, batch.status, batch.raw)
+
+            exported = anon.get("/_test/export")
+            payload = exported.json if isinstance(exported.json, dict) else {}
+
+            # Mutate the world after the export: cancel the booking. A replacing import has to undo
+            # this to re-create the booking the export described.
+            ada.post(f"/reservations/{reference}/cancel")
+            imported = anon.post("/_test/import", json_body=payload)
+            self.assertEqual((exported.status, imported.status), (200, 204),
+                             f"export {exported.status}, import {imported.status}")
+
+            replayed = ada.post(MOVES, json_body={"moves": [
+                {"reference": reference, "table_id": "t_3"}]},
+                headers={"Idempotency-Key": "ki-batch-roundtrip"})
+            body = ada.get(f"/reservations/{reference}")
+            legs = [
+                ("the batch receipt replays 200 with its original body after the round trip",
+                 (200, batch.json), (replayed.status, replayed.json)),
+                ("and the import restored the booking the post-export cancel removed",
+                 "confirmed", (body.json or {}).get("status")),
+                ("at the table the batch moved it to", "t_3", (body.json or {}).get("table_id")),
+            ]
+            assert_all(self, legs)
 
 
 if __name__ == "__main__":

@@ -25,8 +25,10 @@ never cloned.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import pathlib
 import re
+import sqlite3
 import unittest
 from unittest.runner import TextTestResult
 from zoneinfo import ZoneInfo
@@ -732,17 +734,32 @@ class SpecGate(unittest.TestCase):
         assert_all(self, legs)
 
     def test_internal_error_message_is_redacted(self):
-        """The 500 body leaks the SQLite schema. It is the one defect here that is observably a leak.
+        """The 500 body leaks nothing of the service's internals: a fixed string plus a correlation id.
 
-        Same reset as `reset_two_restaurants_sharing_table_ids`, but the assertion is about the
-        message: a fixed string that discloses none of the internals, plus a correlation id so the
-        response is still actionable. Today the message is
-        `"UNIQUE constraint failed: tables.id"`.
+        The trigger this name was written around -- two restaurants sharing table ids, which used
+        to die on a global `tables.id` UNIQUE -- is now the *legal* fixture settled by the
+        `reset_two_restaurants_sharing_table_ids` defect, so it no longer raises anything at reset.
+        The redaction still deserves an honest trigger, so one is built instead: load a valid
+        fixture, then drop the `reservations` table from underneath the service. The next handler
+        read hits a real `OperationalError` and lands in the catch-all the same way any production
+        bug would. Nothing else about this test changes.
         """
         with service() as base_url:
             anon = Client(base_url, token=None)
-            resp = anon.post("/_test/reset",
-                             json_body=fixture(restaurants=two_restaurants(shared_table_ids=True)))
+            reset = anon.post("/_test/reset",
+                              json_body=fixture(restaurants=two_restaurants(shared_table_ids=True)))
+            self.assertEqual(204, reset.status,
+                             "the valid fixture must load before the schema is broken under it")
+            client = anon.authenticate(ADA["email"], ADA["password"])
+
+            conn = sqlite3.connect(os.environ["TABLEKEEPER_DB"])
+            try:
+                conn.execute("DROP TABLE reservations")
+                conn.commit()
+            finally:
+                conn.close()
+
+            resp = client.get("/reservations")
             error = (resp.json or {}).get("error") or {}
             message = error.get("message") or ""
             forbidden = [word for word in ("UNIQUE", "tables.id", "sqlite3", "Traceback")
