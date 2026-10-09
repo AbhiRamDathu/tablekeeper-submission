@@ -1,0 +1,1622 @@
+"""SQLite store for Tablekeeper Stage 1.
+
+One file-backed database, WAL journaling, and `BEGIN IMMEDIATE` for every write. Both are load
+bearing rather than decorative:
+
+* WAL lets the HTTP layer's reader threads run without blocking the writer, which is what keeps 50
+  concurrent requests off each other's toes.
+* `BEGIN IMMEDIATE` takes the write lock up front, so two writers cannot both read "no conflict",
+  both decide to proceed, and both commit. §7 and §11 both depend on that being impossible rather
+  than unlikely.
+
+The connection is opened per operation instead of shared. `sqlite3` connections are not safe to use
+from several threads at once, and the alternative — one shared connection plus a mutex — would
+serialise reads behind the writer and defeat the point of WAL.
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import sqlite3
+from typing import Iterator
+from zoneinfo import ZoneInfo
+
+from .tz import parse_local, resolve
+
+__all__ = ["database_path", "connect", "transaction", "reset_database", "export_state",
+           "import_state", "EXPORT_TRACK", "EXPORT_FORMAT_VERSION", "STATE_SCHEMA",
+           "SCHEMA_TABLES", "InvalidFixture", "InvalidState"]
+
+#: §3: "IDs are opaque strings of at most 64 characters -- **including IDs in reset fixtures**".
+#: A fixture is the only way restaurants, tables and users come into existence, so a 65-character
+#: id admitted here is a 65-character id everywhere else, and §3 states the bound without carving
+#: out the seeding path.
+MAX_ID_LENGTH = 64
+
+#: §4: "`weekday` one of `mon tue wed thu fri sat sun`", and "`opens`/`closes` are local `HH:MM`
+#: 24-hour". The hour bound is not decoration either: "24-hour" excludes 24:00 itself.
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_HHMM_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+
+#: §8:344 -- "`reference` is 6 to 12 characters of `A-Z0-9`, unique across all reservations, and
+#: never changes." A fixture seeds reservations, so a fixture reference has to satisfy the same rule
+#: the create path enforces when it mints a reference; accepting anything else at reset hands a
+#: table a row the service could never have produced.
+_REFERENCE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
+
+# Kept apart from the rest of the schema because the migration below has to reissue exactly this
+# statement. A second hand-written copy of the DDL would be free to drift from the table every fresh
+# database gets, and the drift would only show up in an upgraded one.
+IDEMPOTENCY_DDL = """
+CREATE TABLE IF NOT EXISTS idempotency (
+    key           TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    status_code   INTEGER NOT NULL,
+    response_body TEXT NOT NULL,
+    PRIMARY KEY (key, user_id, scope)
+);
+"""
+
+# Kept apart for the same reason, and it is the one DDL whose *shape* is a requirement rather than a
+# storage detail. §4 constrains a table id by nothing: not by length, not by format, and not by
+# belonging to one restaurant only, so `t_2` is a legal id for every restaurant in the model. A
+# global `id TEXT PRIMARY KEY` says otherwise, and a fixture the specification permits -- two
+# restaurants both owning `t_1..t_3` -- dies at reset on a uniqueness constraint.
+#
+# The composite key is what `available_table_ids` being "tables *of that restaurant*" (§8) is
+# measured against, so it has to exist before any occupancy question across two restaurants can be
+# asked at all.
+# `ordinal` is the position of the row in its parent's *fixture* array, and it is the only ordering
+# §8:112 can be read against: it says "in fixture order" in as many words. Sorting by `id` answers a
+# different question -- alphabetical -- and on a fixture whose ids happen to be `t_1,t_2,t_3` the two
+# agree, which is why an unmet requirement can sit behind a green suite.
+#
+# It is per parent, not global: `ordinal` restarts at 0 for each restaurant, because the arrays are
+# nested and a table's position among its own restaurant's tables is the thing §8:112 means. The
+# unique index is on the pair so two tables of one restaurant cannot claim the same position; it is
+# NOT on `ordinal` alone, which would forbid the same position under two different restaurants.
+#
+# `ORDER BY rowid` is the cheaper-looking answer and is deliberately not used. `tables` has a
+# composite primary key and no INTEGER PRIMARY KEY, which is exactly the case where SQLite documents
+# that VACUUM may renumber ROWIDs -- so rowid order is an accident of insertion that a later
+# maintenance operation can silently invalidate. An ordinal written at insert is a contract; a rowid
+# is a side effect.
+TABLES_DDL = """
+CREATE TABLE IF NOT EXISTS tables (
+    restaurant_id TEXT NOT NULL REFERENCES restaurants(id),
+    id           TEXT NOT NULL,
+    label        TEXT NOT NULL,
+    capacity     INTEGER NOT NULL,
+    ordinal      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (restaurant_id, id)
+);
+"""
+
+# `ordinal` is the same contract as `tables.ordinal`, for the same phrase of the specification:
+# §8:101 returns `opening_hours` and `tables` "in the fixture's shape", and the room reads that as
+# fixture *order* -- `opening_hours_in_fixture_order` and `table_ids_are_returned_in_fixture_order`
+# are two named defects off one clause. Reading it for `tables` and not for `opening_hours` would be
+# an arbitrary line, and the shipped red test for the second one exists precisely to say so.
+#
+# The justification is not "rowid might renumber". Measured on this host, SQLite 3.40.1 did *not*
+# renumber rowids across a VACUUM for either shape, so that argument, though it is what SQLite
+# documents, did not reproduce and is not what this column is for. The measured reason is stronger
+# and simpler: with no `ORDER BY` at all, the returned order is *insertion sequence*, which equals
+# fixture order only while every writer happens to insert in array order. Deleting one row and
+# inserting it again moves it to the end for good, with or without a VACUUM, and `POST /_test/import`
+# (§10) is a second writer that does not exist yet and would have to get this right by accident. A
+# column written at insert is a contract; a rowid is a side effect.
+OPENING_HOURS_DDL = """
+CREATE TABLE IF NOT EXISTS opening_hours (
+    restaurant_id TEXT NOT NULL REFERENCES restaurants(id),
+    weekday       TEXT NOT NULL,
+    opens         TEXT NOT NULL,
+    closes        TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+#: Applied after the ordinal migrations, never before: both indexes name a column that a
+#: pre-ordinal database does not have. See `ensure_schema`.
+#:
+#: `tables_by_ordinal` is UNIQUE and `opening_hours_by_ordinal` deliberately is not, and the
+#: difference is not an oversight. `tables` is keyed `(restaurant_id, id)`, so two rows of one
+#: restaurant cannot be identical and every position among them is unambiguous -- a unique index can
+#: only ever be satisfied. `opening_hours` has **no primary key at all**, so a byte-identical
+#: duplicate row is representable, and a unique index would make `ensure_schema` raise `IntegrityError`
+#: on start for such a database: turning a harmless duplicate into a service that will not boot.
+#: Two indistinguishable rows sharing one ordinal is unobservable in a response, because they render
+#: identically -- so the looser constraint costs nothing and refuses nothing.
+SCHEMA_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS tables_by_ordinal
+    ON tables(restaurant_id, ordinal);
+CREATE INDEX IF NOT EXISTS opening_hours_by_ordinal
+    ON opening_hours(restaurant_id, ordinal);
+"""
+
+SCHEMA_TABLES = """
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    display_name  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tokens (
+    token   TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS restaurants (
+    id                           TEXT PRIMARY KEY,
+    name                         TEXT NOT NULL,
+    timezone                     TEXT NOT NULL,
+    slot_minutes                 INTEGER NOT NULL,
+    reservation_duration_minutes INTEGER NOT NULL,
+    cancellation_cutoff_minutes  INTEGER NOT NULL,
+    combinable                   TEXT NOT NULL DEFAULT '[]',
+    manager_user_ids             TEXT NOT NULL DEFAULT '[]',
+    policy_version               INTEGER NOT NULL DEFAULT 0,
+    restaurant_revision          INTEGER NOT NULL DEFAULT 0
+);
+""" + TABLES_DDL + OPENING_HOURS_DDL + """
+CREATE TABLE IF NOT EXISTS reservations (
+    reference       TEXT PRIMARY KEY,
+    restaurant_id   TEXT NOT NULL,
+    table_id        TEXT NOT NULL,
+    table_ids       TEXT NOT NULL DEFAULT '[]',
+    user_id         TEXT NOT NULL,
+    starts_at_utc   TEXT NOT NULL,
+    starts_at_local TEXT NOT NULL,
+    ends_at_utc     TEXT,
+    party_size      INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 1,
+    accepted_terms  TEXT,
+    series_id       TEXT,
+    series_index    INTEGER,
+    exception       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS reservations_by_table
+    ON reservations(table_id, starts_at_utc);
+CREATE TABLE IF NOT EXISTS policies (
+    restaurant_id                TEXT NOT NULL,
+    policy_version               INTEGER NOT NULL,
+    effective_from               TEXT NOT NULL,
+    slot_minutes                 INTEGER NOT NULL,
+    reservation_duration_minutes INTEGER NOT NULL,
+    cancellation_cutoff_minutes  INTEGER NOT NULL,
+    opening_hours                TEXT NOT NULL,
+    capacities                   TEXT NOT NULL,
+    published_at                 TEXT NOT NULL,
+    PRIMARY KEY (restaurant_id, policy_version)
+);
+CREATE TABLE IF NOT EXISTS reservation_history (
+    reference      TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    at             TEXT NOT NULL,
+    event          TEXT NOT NULL,
+    changes        TEXT NOT NULL,
+    revision       INTEGER NOT NULL,
+    accepted_terms TEXT,
+    PRIMARY KEY (reference, seq)
+);
+CREATE TABLE IF NOT EXISTS series (
+    series_id        TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    restaurant_id    TEXT NOT NULL,
+    anchor_reference TEXT NOT NULL,
+    interval_weeks   INTEGER NOT NULL,
+    revision         INTEGER NOT NULL,
+    created_at       TEXT NOT NULL
+);
+""" + IDEMPOTENCY_DDL
+
+#: The table declarations, under the name callers already read. It is `SCHEMA_TABLES` rather than the
+#: whole schema because the one index that must run after a migration lives in `SCHEMA_INDEXES`;
+#: concatenating it in would restore the failure `ensure_schema` documents. Kept so that code reading
+#: the DDL text -- `test_spec_stage1` takes `tables`' primary key out of it -- does not have to change
+#: to accommodate an ordering constraint it has no stake in.
+SCHEMA = SCHEMA_TABLES
+
+
+def database_path() -> pathlib.Path:
+    """Where the database lives. `TABLEKEEPER_DB` overrides, for tests."""
+    override = os.environ.get("TABLEKEEPER_DB")
+    if override:
+        return pathlib.Path(override)
+    return pathlib.Path(__file__).resolve().parent.parent / "tablekeeper.sqlite"
+
+
+def connect() -> sqlite3.Connection:
+    """A connection with foreign keys and WAL enabled."""
+    path = database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
+@contextlib.contextmanager
+def transaction() -> Iterator[sqlite3.Connection]:
+    """Run a write inside `BEGIN IMMEDIATE`, committing on success and rolling back on any error.
+
+    The rollback is not tidiness. §11 requires that a failed amendment leave the original booking
+    and its occupancy untouched, and that is only true if the failure and the write share one
+    transaction boundary.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+class InvalidFixture(ValueError):
+    """A reset fixture breaks one or more rules REQUIREMENTS states about it.
+
+    One message naming every rule that broke, in fixture order, each carrying the JSON path it
+    applies to. §5:47 pins every 4xx and 5xx body to exactly two keys, so these cannot be a list --
+    they are one sentence in `message`, separated by `; `. That constraint and the requirement to
+    report everything are not in tension: `:47` fixes the *shape* of the body, and nothing in the
+    specification asks for one violation per round trip.
+
+    Reporting only the first was the older behaviour, and it was wrong in a way the transport hid:
+    a fixture with a user missing `password` *and* a reservation with `party_size: 0` answered
+    `users[1].password must be a non-empty string`, and the caller had no way to learn a second
+    defect existed until it had fixed the first, re-sent, and been told again. The masked error was
+    not a smaller sin than the reported one; it was invisible.
+    """
+
+
+class _Violations:
+    """Every rule a fixture breaks, in the order the fixture states them.
+
+    Collected rather than raised so that one bad field cannot hide the next. Validation still
+    happens **before** the transaction opens (see `_validated_fixture`), which is what keeps a
+    rejected fixture from being half-applied -- reporting everything does not weaken that ordering,
+    because nothing is written until the whole fixture has been walked.
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def add(self, message: str) -> None:
+        self.messages.append(message)
+
+    def __bool__(self) -> bool:
+        return bool(self.messages)
+
+    @property
+    def text(self) -> str:
+        return "; ".join(self.messages)
+
+
+def _entries(fixture: dict, key: str, bad: _Violations) -> list[tuple[int, dict]]:
+    """`[(index, row)]` for one top-level array, skipping elements that are not objects.
+
+    A non-object element is recorded and stepped over rather than ending the walk, so the indices
+    that follow it still name the positions the caller wrote. Those indices are what make the
+    message addressable: `users[3].email` has to mean the fourth entry of `users`.
+    """
+    rows = fixture.get(key, [])
+    if not isinstance(rows, list):
+        bad.add(f"{key} must be an array")
+        return []
+    usable = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            bad.add(f"{key}[{index}] must be an object")
+            continue
+        usable.append((index, row))
+    return usable
+
+
+def _text(value: object, path: str, bad: _Violations) -> str | None:
+    if not isinstance(value, str) or not value:
+        bad.add(f"{path} must be a non-empty string")
+        return None
+    return value
+
+
+def _identifier(value: object, path: str, bad: _Violations) -> str | None:
+    value = _text(value, path, bad)
+    if value is None:
+        return None
+    if len(value) > MAX_ID_LENGTH:
+        bad.add(f"{path} must be at most {MAX_ID_LENGTH} characters")
+        return None
+    return value
+
+
+def _integer(value: object, path: str, bad: _Violations) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        bad.add(f"{path} must be an integer")
+        return None
+    return value
+
+
+def _positive(value: object, path: str, bad: _Violations) -> int | None:
+    value = _integer(value, path, bad)
+    if value is None:
+        return None
+    if value < 1:
+        bad.add(f"{path} must be a positive integer")
+        return None
+    return value
+
+
+def _hhmm(value: str | None, path: str, bad: _Violations) -> int | None:
+    """Minutes past local midnight, or `None` having recorded why not.
+
+    Returning the number rather than the string is what lets the closes-after-opens rule be a
+    comparison instead of a second parse, so a malformed `HH:MM` is reported once rather than
+    reported as a format error and again as a nonsensical ordering.
+    """
+    if value is None:
+        return None
+    if not _HHMM_RE.match(value):
+        bad.add(f"{path} must be local HH:MM on a 24-hour clock")
+        return None
+    return int(value[:2]) * 60 + int(value[3:])
+
+
+def _nested(restaurant: dict, key: str, path: str, bad: _Violations) -> list[tuple[int, dict]]:
+    rows = restaurant.get(key, [])
+    if not isinstance(rows, list):
+        bad.add(f"{path}.{key} must be an array")
+        return []
+    usable = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            bad.add(f"{path}.{key}[{index}] must be an object")
+            continue
+        usable.append((index, row))
+    return usable
+
+
+def _instant(reservation: dict, zones: dict[str, str], path: str, bad: _Violations) -> str | None:
+    """The instant a seeded booking occupies, as `YYYY-MM-DDTHH:MM:SS±HH:MM`.
+
+    §4 gives a fixture reservation "the same fields as a create body plus `id`, `reference`,
+    `user_id`", and a create body has no `starts_at_utc` in it -- so a fixture author who follows
+    the specification cannot supply one, and inserting the row as written dies on a `KeyError`
+    that reaches the caller as a 500. It is derived here instead, from the same two facts a create
+    derives it from: the wall clock the guest means, and the restaurant's zone.
+
+    A fixture that *does* carry `starts_at_utc` keeps it. A test pinning an absolute instant is
+    isolating something other than this rule, and §9's absolute-time arithmetic is only checkable
+    when the instant is one the test chose.
+
+    Returns `None` having recorded why, so one unusable booking does not stop the rest being
+    checked. Every read of the reservation is therefore guarded: the caller reaches here only when
+    `restaurant_id` is a usable id present in `zones`, but `starts_at_local` itself is a field the
+    fixture may simply omit, and indexing it unguarded is the `KeyError` this docstring is about.
+    """
+    if "starts_at_utc" in reservation:
+        instant = _text(reservation["starts_at_utc"], f"{path}.starts_at_utc", bad)
+        if instant is None:
+            return None
+        # A fixture that carries an instant is accepted, but only one that parses as an aware RFC
+        # 3339 instant. Requirement.md:17 makes the downstream parse failures this guarded against
+        # into 5xx responses from `GET /availability` and `GET /reservations`, which no endpoint may
+        # answer; §8's worked example renders `starts_at` with an offset, so a bare wall time is not
+        # an acceptable stand-in either.
+        try:
+            parsed = dt.datetime.fromisoformat(instant)
+        except ValueError:
+            bad.add(f"{path}.starts_at_utc must parse as an RFC 3339 instant")
+            return None
+        if parsed.tzinfo is None:
+            bad.add(f"{path}.starts_at_utc must carry a UTC offset")
+            return None
+        return instant
+
+    local = _text(reservation.get("starts_at_local"), f"{path}.starts_at_local", bad)
+    if local is None:
+        return None
+    try:
+        naive = parse_local(local)
+    except ValueError:
+        bad.add(f"{path}.starts_at_local must look like YYYY-MM-DDTHH:MM")
+        return None
+    try:
+        zone = ZoneInfo(zones[reservation["restaurant_id"]])
+    except LookupError:
+        bad.add(f"{path}.restaurant_id names a restaurant whose timezone is not"
+                " known to this platform")
+        return None
+    try:
+        return resolve(naive, zone).isoformat()
+    except ValueError:
+        bad.add(f"{path}.starts_at_local falls inside a clock change, so that local"
+                " time never happened")
+        return None
+
+
+def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
+    """Every rule §3 and §4 state about a fixture, checked before any transaction is opened.
+
+    Returns `(zones, instants)`: each restaurant's timezone keyed by id, and the derived instant of
+    each seeded reservation that did not carry one, keyed by its index in `reservations`.
+
+    **Whole fixture, in fixture order, before the transaction.** A failure halfway through a
+    transaction would be a rollback, not a rejection: `transaction()` restores the *previous*
+    fixture, so a 422 raised mid-insert would hand the caller an error and leave the world it asked
+    to replace still in place. That ordering is what makes a rejection trustworthy, and it is why
+    the whole walk completes before `reset_database` writes a single row.
+
+    **Every violation, not the first.** Each check records and continues rather than raising, so the
+    answer names every rule the fixture broke instead of the first one the walk reached. The two
+    decisions are independent: reporting everything does not weaken "validate before you write",
+    because nothing is written until the walk finishes either way.
+
+    Reporting every violation does mean a field the walk could not use is skipped rather than
+    descended into -- a `restaurant_id` that is not a usable string is reported once, and the
+    reservation's own `starts_at_local` is not additionally reported as missing, because the
+    fixture is already known to be unusable and a second sentence about it would be noise.
+
+    What is deliberately *not* checked: a seeded reservation against its table's capacity or
+    opening hours. §4 constrains neither, and §4 says a booking is not rejected for being in the
+    past -- so the rules that do exist are the ones checked here. A timezone *is* checked against
+    the IANA database and `starts_at_utc` *is* required to parse, because violating either hands
+    the caller a world that 500s the next read instead of a world that serves responses.
+    """
+    bad = _Violations()
+
+    seen_user_ids: set[str] = set()
+    seen_emails: set[str] = set()
+    for index, user in _entries(fixture, "users", bad):
+        path = f"users[{index}]"
+        user_id = _identifier(user.get("id"), f"{path}.id", bad)
+        if user_id is not None:
+            if user_id in seen_user_ids:
+                bad.add(f"{path}.id duplicates a user already in this fixture")
+            seen_user_ids.add(user_id)
+        email = _text(user.get("email"), f"{path}.email", bad)
+        if email is not None:
+            if email in seen_emails:
+                bad.add(f"{path}.email duplicates a user already in this fixture")
+            seen_emails.add(email)
+        _text(user.get("password"), f"{path}.password", bad)
+        if "display_name" in user:
+            _text(user["display_name"], f"{path}.display_name", bad)
+
+    zones: dict[str, str] = {}
+    known_tables: set[tuple[str, str]] = set()
+    seen_restaurant_ids: set[str] = set()
+    for index, restaurant_row in _entries(fixture, "restaurants", bad):
+        path = f"restaurants[{index}]"
+        restaurant_id = _identifier(restaurant_row.get("id"), f"{path}.id", bad)
+        if restaurant_id is not None:
+            if restaurant_id in seen_restaurant_ids:
+                bad.add(f"{path}.id duplicates a restaurant already in this fixture")
+            seen_restaurant_ids.add(restaurant_id)
+        _text(restaurant_row.get("name"), f"{path}.name", bad)
+        timezone = _text(restaurant_row.get("timezone"), f"{path}.timezone", bad)
+        if timezone is not None:
+            # An unresolvable zone is a state the service cannot serve and then 500s from the
+            # endpoints that read it (§9 resolves zones when they are read). The platform has to be
+            # able to resolve the zone at reset time, or every availability/reservation response
+            # for this restaurant is a 500 -- which REQUIREMENTS.md:17 forbids.
+            try:
+                ZoneInfo(timezone)
+            except LookupError:
+                bad.add(f"{path}.timezone must be an IANA zone this platform can resolve")
+        if restaurant_id is not None and timezone is not None:
+            zones[restaurant_id] = timezone
+        _positive(restaurant_row.get("slot_minutes"), f"{path}.slot_minutes", bad)
+        _positive(restaurant_row.get("reservation_duration_minutes"),
+                  f"{path}.reservation_duration_minutes", bad)
+        cutoff = _integer(restaurant_row.get("cancellation_cutoff_minutes"),
+                          f"{path}.cancellation_cutoff_minutes", bad)
+        if cutoff is not None and cutoff < 0:
+            bad.add(f"{path}.cancellation_cutoff_minutes must not be negative")
+
+        seen_tables: set[tuple[str, int]] = set()
+        for hours_index, hours in _nested(restaurant_row, "opening_hours", path, bad):
+            hours_path = f"{path}.opening_hours[{hours_index}]"
+            if hours.get("weekday") not in _WEEKDAYS:
+                bad.add(f"{hours_path}.weekday must be one of "
+                        f"{' '.join(_WEEKDAYS)}")
+            opens = _text(hours.get("opens"), f"{hours_path}.opens", bad)
+            closes = _text(hours.get("closes"), f"{hours_path}.closes", bad)
+            opens_minutes = _hhmm(opens, f"{hours_path}.opens", bad)
+            closes_minutes = _hhmm(closes, f"{hours_path}.closes", bad)
+            if opens_minutes is not None and closes_minutes is not None \
+                    and closes_minutes <= opens_minutes:
+                bad.add(f"{hours_path}.closes must be later than .opens on the same "
+                        "local day, because hours never cross midnight")
+
+        for table_index, table_row in _nested(restaurant_row, "tables", path, bad):
+            table_path = f"{path}.tables[{table_index}]"
+            table_id = _identifier(table_row.get("id"), f"{table_path}.id", bad)
+            if restaurant_id is not None and table_id is not None:
+                if (restaurant_id, table_id) in seen_tables:
+                    bad.add(f"{table_path}.id duplicates a table already in this restaurant")
+            if restaurant_id is not None and table_id is not None:
+                known_tables.add((restaurant_id, table_id))
+            seen_tables.add((restaurant_id, table_id))
+            _text(table_row.get("label"), f"{table_path}.label", bad)
+            _positive(table_row.get("capacity"), f"{table_path}.capacity", bad)
+
+        combinable = restaurant_row.get("combinable", [])
+        if combinable is None:
+            combinable = []
+        if not isinstance(combinable, list):
+            bad.add(f"{path}.combinable must be an array")
+        else:
+            seen_pairs: set[frozenset[str]] = set()
+            for pair_index, pair in enumerate(combinable):
+                pair_path = f"{path}.combinable[{pair_index}]"
+                if (not isinstance(pair, list) or len(pair) != 2
+                        or any(not isinstance(member, str) or not member for member in pair)):
+                    bad.add(f"{pair_path} must be an array of exactly two table ids")
+                    continue
+                if pair[0] == pair[1]:
+                    bad.add(f"{pair_path} names the same table twice")
+                for member in pair:
+                    if restaurant_id is not None and (restaurant_id, member) not in known_tables:
+                        bad.add(f"{pair_path} names a table that is not in this restaurant")
+                key = frozenset(pair)
+                if key in seen_pairs:
+                    bad.add(f"{pair_path} repeats a combination already in this restaurant")
+                seen_pairs.add(key)
+
+    instants: dict[int, str] = {}
+    seen_references: set[str] = set()
+    for index, reservation in _entries(fixture, "reservations", bad):
+        path = f"reservations[{index}]"
+        reference = _identifier(reservation.get("reference"), f"{path}.reference", bad)
+        if reference is not None:
+            if not _REFERENCE_RE.match(reference):
+                bad.add(f"{path}.reference must be 6 to 12 characters of A-Z0-9")
+            elif reference in seen_references:
+                bad.add(f"{path}.reference duplicates a reservation already in this fixture")
+            seen_references.add(reference)
+        restaurant_id = _identifier(reservation.get("restaurant_id"),
+                                    f"{path}.restaurant_id", bad)
+        known = restaurant_id is not None and restaurant_id in zones
+        if restaurant_id is not None and not known:
+            bad.add(f"{path}.restaurant_id must name a restaurant in this fixture")
+        table_id = reservation.get("table_id")
+        table_ids = reservation.get("table_ids")
+        if table_id is not None and table_ids is not None:
+            bad.add(f"{path} must not carry both table_id and table_ids")
+        elif table_ids is not None:
+            if (not isinstance(table_ids, list) or not table_ids
+                    or any(not isinstance(member, str) or not member for member in table_ids)):
+                bad.add(f"{path}.table_ids must be a non-empty array of table ids")
+            elif len(table_ids) > 2:
+                bad.add(f"{path}.table_ids must name at most two tables")
+            else:
+                if len(set(table_ids)) != len(table_ids):
+                    bad.add(f"{path}.table_ids names the same table twice")
+                if known:
+                    for member in table_ids:
+                        if (restaurant_id, member) not in known_tables:
+                            bad.add(f"{path}.table_ids names a table that is not in this"
+                                    " restaurant")
+                            break
+        else:
+            _text(table_id, f"{path}.table_id", bad)
+        _identifier(reservation.get("user_id"), f"{path}.user_id", bad)
+        _positive(reservation.get("party_size"), f"{path}.party_size", bad)
+        if known:
+            instant = _instant(reservation, zones, path, bad)
+            if instant is not None:
+                instants[index] = instant
+
+    if bad:
+        raise InvalidFixture(bad.text)
+
+    return zones, instants
+
+
+def terms_from_restaurant(restaurant: dict, policy_version: int = 0) -> dict:
+    """The accepted-terms snapshot of a fixture restaurant's original rules (policy 0).
+
+    §Policies and accepted terms: every reservation carries "a snapshot of the entire selected
+    policy, excluding `effective_from`". Policy 0 is the original fixture's own rules, so this is
+    the snapshot a freshly seeded booking accepts.
+    """
+    return {
+        "policy_version": policy_version,
+        "slot_minutes": restaurant["slot_minutes"],
+        "reservation_duration_minutes": restaurant["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": restaurant["cancellation_cutoff_minutes"],
+        "opening_hours": [
+            {"weekday": h["weekday"], "opens": h["opens"], "closes": h["closes"]}
+            for h in restaurant.get("opening_hours", [])
+        ],
+        "capacities": {t["id"]: t["capacity"] for t in restaurant.get("tables", [])},
+    }
+
+
+def policy_zero(conn: sqlite3.Connection, restaurant_id: str) -> dict:
+    """Policy 0 for a stored restaurant: its original fixture rules, in fixture order."""
+    row = conn.execute("SELECT * FROM restaurants WHERE id = ?", (restaurant_id,)).fetchone()
+    hours = conn.execute(
+        "SELECT weekday, opens, closes FROM opening_hours WHERE restaurant_id = ?"
+        " ORDER BY ordinal, weekday, opens, closes", (restaurant_id,)).fetchall()
+    tables = conn.execute(
+        "SELECT id, capacity FROM tables WHERE restaurant_id = ? ORDER BY ordinal, id",
+        (restaurant_id,)).fetchall()
+    return {
+        "policy_version": 0,
+        "slot_minutes": row["slot_minutes"],
+        "reservation_duration_minutes": row["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": row["cancellation_cutoff_minutes"],
+        "opening_hours": [{"weekday": h["weekday"], "opens": h["opens"], "closes": h["closes"]}
+                          for h in hours],
+        "capacities": {t["id"]: t["capacity"] for t in tables},
+    }
+
+
+def reset_database(fixture: dict) -> None:
+    """Replace the entire contents with `fixture`, atomically.
+
+    Everything observable after this call comes from `fixture` and nothing else, which is what
+    makes a test's starting state predictable. One transaction: a partially applied reset would
+    leave a world that no fixture describes.
+
+    The fixture is checked in full before that transaction opens, so a fixture the specification
+    does not permit is *rejected* rather than half-applied -- see `_validated_fixture` for why the
+    ordering is load-bearing.
+    """
+    _zones, instants = _validated_fixture(fixture)
+    with transaction() as conn:
+        for table in _STATE_DELETE_ORDER:
+            conn.execute(f"DELETE FROM {table}")
+
+        for user in fixture.get("users", []):
+            # A seeded account has a known password in the fixture only when it is given one.
+            # The harness seeds users with a plaintext password and logs in immediately, so the
+            # fixture's password must be hashed the same way a signup would be.
+            from . import auth
+
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash, display_name) VALUES (?, ?, ?, ?)",
+                (user["id"], user["email"], auth.hash_password(user["password"]),
+                 user.get("display_name", user["id"])),
+            )
+
+        for restaurant in fixture.get("restaurants", []):
+            conn.execute(
+                "INSERT INTO restaurants (id, name, timezone, slot_minutes,"
+                " reservation_duration_minutes, cancellation_cutoff_minutes, combinable,"
+                " manager_user_ids, policy_version, restaurant_revision)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+                (restaurant["id"], restaurant["name"], restaurant["timezone"],
+                 restaurant["slot_minutes"], restaurant["reservation_duration_minutes"],
+                 restaurant["cancellation_cutoff_minutes"],
+                 json.dumps(restaurant.get("combinable", [])),
+                 json.dumps(restaurant.get("manager_user_ids", []))),
+            )
+            for hours_ordinal, hours in enumerate(restaurant.get("opening_hours", [])):
+                conn.execute(
+                    "INSERT INTO opening_hours (restaurant_id, weekday, opens, closes, ordinal)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (restaurant["id"], hours["weekday"], hours["opens"], hours["closes"],
+                     hours_ordinal),
+                )
+            for table_ordinal, table in enumerate(restaurant.get("tables", [])):
+                conn.execute(
+                    "INSERT INTO tables (restaurant_id, id, label, capacity, ordinal)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (restaurant["id"], table["id"], table["label"], table["capacity"],
+                     table_ordinal),
+                )
+
+        restaurants_by_id = {restaurant["id"]: restaurant
+                             for restaurant in fixture.get("restaurants", [])}
+        durations = {restaurant["id"]: restaurant["reservation_duration_minutes"]
+                     for restaurant in fixture.get("restaurants", [])}
+        for index, reservation in enumerate(fixture.get("reservations", [])):
+            table_id = reservation.get("table_id")
+            if table_id is None:
+                table_ids = list(reservation["table_ids"])
+                table_id = table_ids[0]
+            else:
+                table_ids = list(reservation.get("table_ids") or [table_id])
+            starts_at_utc = instants[index]
+            ends_at_utc = reservation.get("ends_at_utc")
+            if ends_at_utc is None:
+                ends_at_utc = (
+                    dt.datetime.fromisoformat(starts_at_utc)
+                    + dt.timedelta(minutes=durations[reservation["restaurant_id"]])
+                ).isoformat()
+            created_at = reservation.get("created_at",
+                                         dt.datetime.now(dt.timezone.utc).isoformat())
+            terms = terms_from_restaurant(restaurants_by_id[reservation["restaurant_id"]])
+            conn.execute(
+                "INSERT INTO reservations (reference, restaurant_id, table_id, table_ids,"
+                " user_id, starts_at_utc, starts_at_local, ends_at_utc, party_size, status,"
+                " created_at, revision, accepted_terms, series_id, series_index, exception)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, 0)",
+                (reservation["reference"], reservation["restaurant_id"],
+                 table_id, json.dumps(table_ids), reservation["user_id"],
+                 starts_at_utc, reservation["starts_at_local"], ends_at_utc,
+                 reservation["party_size"],
+                 reservation.get("status", "confirmed"), created_at,
+                 json.dumps(terms)),
+            )
+            created_changes = [{
+                "field": "table_id" if len(table_ids) == 1 else "table_ids",
+                "from": None, "to": table_id if len(table_ids) == 1 else table_ids,
+            }, {
+                "field": "starts_at_local", "from": None, "to": reservation["starts_at_local"],
+            }, {
+                "field": "party_size", "from": None, "to": reservation["party_size"],
+            }]
+            conn.execute(
+                "INSERT INTO reservation_history (reference, seq, at, event, changes,"
+                " revision, accepted_terms) VALUES (?, 1, ?, 'created', ?, 1, ?)",
+                (reservation["reference"], created_at, json.dumps(created_changes),
+                 json.dumps(terms)),
+            )
+
+
+# ---- §10: export and import -------------------------------------------------------------------
+#
+# §10 asks for one object that leaves the service carrying everything it had, and one endpoint that
+# puts it back. The shape of the work is decided by what §10:167 and §10:175 require and by what
+# they refuse:
+#
+# * **Replacement, not reseeding.** §10:167 says import "is replacement, not merge; repeating it
+#   restores the exported state without duplicating anything", and §10:180 spells out the failure
+#   mode by name: "replacing the state with a fresh fixture does not satisfy this requirement". A
+#   fixture carries plaintext passwords and no receipts, no tokens and no timestamps, so routing
+#   import through `reset_database` would pass every status-code assertion in the section and lose
+#   every identity in it. Hence a row-level dump and a row-level restore, with `reset_database` left
+#   doing what §3.3 asks of it.
+# * **Everything, or nothing.** §10:169-170 requires an invalid envelope to answer 422 "without
+#   changing the destination", so the whole state is validated before a transaction opens, and the
+#   truncate-and-rewrite then shares one `BEGIN IMMEDIATE`. There is no window in which the
+#   destination is half an imported world.
+# * **Opaque to the caller, and a round trip.** §10:165 makes `state` "implementation-defined" but
+#   requires import to accept an unchanged export "produced by this service" -- so `import` reads
+#   back everything `export` wrote, in a deterministic order, with nothing derived on either side.
+
+#: §10:163-164 pins the two fields the envelope carries besides `state`, and §10:165 makes `state`
+#: opaque. These three constants are the whole of what a caller may rely on. They are declared here,
+#: next to the state they wrap, because they are one declaration: an export written with one `track`
+#: and refused by an import reading another is a bug a single source cannot have.
+EXPORT_TRACK = "tablekeeper"
+EXPORT_FORMAT_VERSION = 1
+
+#: Inside `state`, and deliberately *not* one of the three envelope fields. §10 names `track` and
+#: `format_version` and says of `state` only that it is "an implementation-defined JSON object" which
+#: import "must accept unchanged"; it also requires import to answer 422 to "an invalid state",
+#: which needs something to tell valid from invalid. This marker is that something: an object
+#: carrying it is one of our exports, and one that does not is refused before a single row is
+#: written rather than being handed to the table writers and failing there as a `sqlite3` error.
+#:
+#: It is a *marker*, not a compatibility promise. Bumping the schema is a deliberate migration, and
+#: the honest form of one is to teach `_validated_state` the old shape beside the new -- not to
+#: accept a shape and hope.
+STATE_SCHEMA = "tablekeeper/state/3"
+
+#: Schemas import still accepts. A stage-1 export has no `combinable`, no `table_ids`, no
+#: `ends_at_utc`; a stage-2 export has no managers, policies, reservation revisions or series. §10
+#: requires a new service to accept a state its predecessor exported, so every later column and
+#: table is optional on the way in and filled with its default here.
+_STATE_SCHEMAS = ("tablekeeper/state/1", "tablekeeper/state/2", "tablekeeper/state/3")
+
+#: Whole tables a predecessor export does not carry. Their absence is not an error: a stage-2
+#: export has no `policies`, `series` or `reservation_history`, and import fills them with nothing.
+_STATE_OPTIONAL_TABLES = frozenset({"policies", "series", "reservation_history"})
+
+#: Every state table, with the columns an export writes and an import reads back, and the JSON type
+#: each column must hold. One structure for all three jobs on purpose: the column list an export
+#: reads, the column list an import writes and the type list a validation pass checks are three views
+#: of the same declaration, and three separate lists would be free to disagree -- an import that
+#: wrote a column the export did not carry would fail at the primary key, inside the transaction,
+#: as a 500 rather than as the 422 §10:169 asks for.
+#:
+#: Iteration order is load-bearing too: this is the order rows are *inserted*, and `tokens`,
+#: `opening_hours` and `tables` all carry a foreign key, so a parent must be written before its
+#: children or the insert fails.
+_STATE_TABLES_SPEC: dict[str, tuple[tuple[str, type], ...]] = {
+    "users": (("id", str), ("email", str), ("password_hash", str), ("display_name", str)),
+    "tokens": (("token", str), ("user_id", str)),
+    "restaurants": (("id", str), ("name", str), ("timezone", str), ("slot_minutes", int),
+                    ("reservation_duration_minutes", int), ("cancellation_cutoff_minutes", int),
+                    ("combinable", str), ("manager_user_ids", str), ("policy_version", int),
+                    ("restaurant_revision", int)),
+    "opening_hours": (("restaurant_id", str), ("weekday", str), ("opens", str), ("closes", str),
+                      ("ordinal", int)),
+    "tables": (("restaurant_id", str), ("id", str), ("label", str), ("capacity", int),
+               ("ordinal", int)),
+    "policies": (("restaurant_id", str), ("policy_version", int), ("effective_from", str),
+                 ("slot_minutes", int), ("reservation_duration_minutes", int),
+                 ("cancellation_cutoff_minutes", int), ("opening_hours", str),
+                 ("capacities", str), ("published_at", str)),
+    "series": (("series_id", str), ("user_id", str), ("restaurant_id", str),
+               ("anchor_reference", str), ("interval_weeks", int), ("revision", int),
+               ("created_at", str)),
+    "reservations": (("reference", str), ("restaurant_id", str), ("table_id", str),
+                     ("table_ids", str), ("user_id", str), ("starts_at_utc", str),
+                     ("starts_at_local", str), ("ends_at_utc", str), ("party_size", int),
+                     ("status", str), ("created_at", str), ("revision", int),
+                     ("accepted_terms", str), ("series_id", str), ("series_index", int),
+                     ("exception", int)),
+    "reservation_history": (("reference", str), ("seq", int), ("at", str), ("event", str),
+                            ("changes", str), ("revision", int), ("accepted_terms", str)),
+    "idempotency": (("key", str), ("user_id", str), ("scope", str), ("request_hash", str),
+                    ("status_code", int), ("response_body", str)),
+}
+
+#: Columns an earlier export does not carry, and the value to use when a state omits one.
+_STATE_OPTIONAL: dict[tuple[str, str], object] = {
+    ("restaurants", "combinable"): "[]",
+    ("restaurants", "manager_user_ids"): "[]",
+    ("restaurants", "policy_version"): 0,
+    ("restaurants", "restaurant_revision"): 0,
+    ("reservations", "table_ids"): None,
+    ("reservations", "ends_at_utc"): None,
+    ("reservations", "revision"): 1,
+    ("reservations", "accepted_terms"): None,
+    ("reservations", "series_id"): None,
+    ("reservations", "series_index"): None,
+    ("reservations", "exception"): 0,
+}
+
+#: Columns a `state` may legitimately carry as JSON `null`.
+_STATE_NULLABLE: frozenset[tuple[str, str]] = frozenset({
+    ("reservations", "ends_at_utc"), ("reservations", "accepted_terms"),
+    ("reservations", "series_id"), ("reservations", "series_index"),
+})
+
+#: The order a replacement empties the tables in, and it is not the insert order reversed by habit
+#: but the order the foreign keys force: every child has to go before its parent, because
+#: `connect()` sets `PRAGMA foreign_keys=ON` and a parent row with a child still pointing at it
+#: cannot be deleted. `reset_database` deletes in this same order, and the two are one invariant
+#: rather than two coincidentally equal literals -- a second list would be free to drift and would
+#: fail as an `IntegrityError` inside the transaction, which for `import` means a rollback on a
+#: correct object.
+_STATE_DELETE_ORDER = ("idempotency", "reservation_history", "series", "policies",
+                       "reservations", "tokens", "opening_hours",
+                       "tables", "restaurants", "users")
+
+#: Every set of columns whose rows must be distinct within a table, per table. The first tuple of a
+#: table is its primary key; the rest are the other uniqueness the schema declares.
+#:
+#: This exists because §10:169 requires "an invalid state" to be refused with 422 *before* the
+#: destination changes, and a primary key twice is invalid state by the plainest reading available --
+#: yet `sqlite3` raises it as an `IntegrityError` from inside the write, which the handler's catch-all
+#: turns into `500 internal_error`. That is wrong twice: §10:170 asks for 422, and REQUIREMENTS.md:17
+#: ("No 5xx responses, including under concurrent load") is unconditional, and this is neither.
+#:
+#: `users.email` and the `tables_by_ordinal` unique index are here for the same reason as the primary
+#: keys and are the two a hand-written check most often forgets -- an email carried twice and a second
+#: table claiming one fixture position are both states this service could not have exported.
+#:
+#: `opening_hours` has no entry beyond an empty tuple and that is deliberate, not an omission:
+#: `opening_hours_by_ordinal` is a *plain* index, precisely so that a byte-identical duplicate row is
+#: representable. `SCHEMA_INDEXES` records why, and adding a uniqueness rule here would refuse a state
+#: the database itself accepts -- which §10:165 forbids, because import must accept an unchanged
+#: export of ours.
+_STATE_UNIQUE_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "users": (("id",), ("email",)),
+    "tokens": (("token",),),
+    "restaurants": (("id",),),
+    "opening_hours": (),
+    "tables": (("restaurant_id", "id"), ("restaurant_id", "ordinal")),
+    "policies": (("restaurant_id", "policy_version"),),
+    "series": (("series_id",),),
+    "reservations": (("reference",),),
+    "reservation_history": (("reference", "seq"),),
+    "idempotency": (("key", "user_id", "scope"),),
+}
+
+#: Every `(column, parent table, parent column)` a `state` row must find already present in the rows
+#: it carries, per table.
+#:
+#: The same reason as `_STATE_UNIQUE_KEYS`, from the other side: `connect()` sets
+#: `PRAGMA foreign_keys=ON`, so a child naming a parent the state does not contain fails the write as
+#: an `IntegrityError` -- a 500 where §10:170 asks for a 422.
+#:
+#: Only what `SCHEMA_TABLES` declares is listed. `reservations.restaurant_id`, `.table_id` and
+#: `.user_id` are plain `TEXT` with no `REFERENCES` clause, and restating them here would make import
+#: refuse states the database would have accepted; the section is about a round trip of this
+#: service's own export, and this service never writes a reservation that points at nothing.
+_STATE_FOREIGN_KEYS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "users": (),
+    "tokens": (("user_id", "users", "id"),),
+    "restaurants": (),
+    "opening_hours": (("restaurant_id", "restaurants", "id"),),
+    "tables": (("restaurant_id", "restaurants", "id"),),
+    "policies": (),
+    "series": (),
+    "reservations": (),
+    "reservation_history": (),
+    "idempotency": (),
+}
+
+#: The order an export reads each table in. Nothing here is a product requirement -- an export may
+#: list its rows in whatever order is cheapest -- but it *is* the reason
+#: `export(import(state)) == state` holds, which §10:165 turns on: import accepts the object
+#: unchanged and the caller may reasonably export it again and compare. Ordering on the primary key
+#: makes that true of a database the service cannot otherwise tell apart from any other.
+#:
+#: `tables` and `opening_hours` are the two that are not keyed by something unique. They are read on
+#: `(parent, ordinal)` first so fixture order survives the round trip, and the remaining columns are
+#: in the ORDER BY only to make the read total: `opening_hours` has no primary key at all, so two
+#: byte-identical rows are representable, and a reader that stopped at `ordinal` could emit them in
+#: either order on two runs over one database.
+_STATE_READ_ORDER = {
+    "users": "id",
+    "tokens": "token",
+    "restaurants": "id",
+    "opening_hours": "restaurant_id, ordinal, weekday, opens, closes",
+    "tables": "restaurant_id, ordinal, id",
+    "policies": "restaurant_id, policy_version",
+    "series": "series_id",
+    "reservations": "reference",
+    "reservation_history": "reference, seq",
+    "idempotency": "key, user_id, scope",
+}
+
+
+class InvalidState(ValueError):
+    """An import object breaks one of the rules §10 states about it.
+
+    Separate from `InvalidFixture` rather than shared with it because the two are judged by
+    different contracts and are reached from different endpoints: §3.3 validates a fixture, §10
+    validates an opaque round trip of this service's own making. A caller cannot author a valid
+    `state` by reading §4, so reusing the fixture's rules here would refuse objects §10 requires
+    import to accept.
+    """
+
+
+def export_state() -> dict:
+    """The whole service state as one JSON value. §10:162-167.
+
+    **One read transaction, so the object is one instant.** §10:167 requires export to be "an
+    atomic, read-only snapshot; subsequent source writes do not change it". WAL gives a deferred
+    transaction its snapshot at the first read, so every table below is read from the same picture of
+    the database -- a reader taking seven separate connections could otherwise be handed a
+    reservation whose receipt had not been written yet, which is precisely the pairing §10:176
+    requires to survive the round trip.
+
+    **Row-level, and every row of every table.** §10:179 lists what has to come back: accounts and
+    their hashed passwords, existing bearer tokens, fixture configuration, reservations and
+    references, and "all completed idempotent request bodies and original responses". The
+    `idempotency` table is therefore exported whole, `request_hash` and `response_body` included --
+    it is what makes a lost-response retry replay rather than book twice after the import, which is
+    the requirement §10 and §11:205 both rest on.
+
+    **The fixture's `ordinal` columns are carried, not recomputed.** `tables` and `opening_hours`
+    order by a position in the fixture array that exists nowhere else, and §8:112 asks for
+    "fixture order" in as many words. An import that re-derived an ordinal from the row order would
+    be guessing at the one thing the export was able to state exactly.
+
+    Nothing here is filtered, hashed or redacted. §10:163 says an export "may contain credentials
+    and session tokens", so `password_hash` and `token` travel, and `track`/`format_version` are how
+    the caller knows it is holding something private.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        state: dict[str, object] = {"schema": STATE_SCHEMA}
+        for table, spec in _STATE_TABLES_SPEC.items():
+            names = [name for name, _ in spec]
+            rows = conn.execute(
+                f"SELECT {', '.join(names)} FROM {table}"
+                f" ORDER BY {_STATE_READ_ORDER[table]}"
+            ).fetchall()
+            state[table] = [{name: row[name] for name in names} for row in rows]
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+    return state
+
+
+def import_state(state: object) -> None:
+    """Replace the entire contents with `state`, atomically. §10:167-180.
+
+    **Validated in full before the transaction opens**, for the reason `_validated_fixture` gives
+    and not because the two share a rule: §10:170 requires 422 "without changing the destination",
+    and a validation failure raised mid-truncate would be a rollback, which leaves the destination
+    intact only by luck of where the walk stopped. Validating first makes the refusal a refusal
+    rather than an accident.
+
+    **Rows are written back verbatim, by column name.** `reference`, `reservation_id`,
+    `created_at`, `starts_at_utc`, token strings and receipt bodies are all copied rather than
+    regenerated, because §10:175 requires identities, statuses and timestamps not to move and
+    §10:178 requires an existing retry to still replay the original response afterwards. An unknown
+    key in a row is ignored and a missing one is refused, both during validation, so nothing a
+    caller adds can reach a column the export did not name.
+
+    **Replacement, so everything after the export is gone.** Every table is emptied before any row
+    is written, which is what removes "all previous destination data and credentials" (§10:180) --
+    including an account created after the export, whose token then resolves to nothing and answers
+    401 rather than authenticating an account that no longer exists.
+
+    **A constraint `sqlite3` is the only one to notice is still a 422, not a 500.**
+    `_validated_state` enumerates the declared ones; this is the floor under that enumeration, so a
+    constraint added to the schema later answers 422 rather than escaping as `internal_error`. The
+    message is ours and names the table rather than repeating `sqlite3`'s text, because §5 pins the
+    body to two keys and a raw constraint string is schema detail served on an unauthenticated route.
+    """
+    _validated_state(state)
+    with transaction() as conn:
+        for table in _STATE_DELETE_ORDER:
+            conn.execute(f"DELETE FROM {table}")
+        durations = {restaurant["id"]: restaurant["reservation_duration_minutes"]
+                     for restaurant in state["restaurants"]}
+        for table, spec in _STATE_TABLES_SPEC.items():
+            entries = state.get(table, [])
+            if table in _STATE_OPTIONAL_TABLES and table not in state:
+                continue
+            names = [name for name, _ in spec]
+            placeholders = ", ".join("?" * len(names))
+            statement = (f"INSERT INTO {table} ({', '.join(names)}) VALUES ({placeholders})")
+            try:
+                for row in entries:
+                    conn.execute(statement,
+                                 tuple(_state_value(table, name, row, durations) for name in names))
+            except sqlite3.IntegrityError as exc:
+                raise InvalidState(
+                    f"state.{table} does not satisfy the constraints the schema declares") from exc
+        _backfill_stage3(conn)
+
+
+def _state_value(table: str, name: str, row: dict, durations: dict[str, int]) -> object:
+    """The value to bind for one `state` cell, filling a stage-1 omission with its default.
+
+    A stage-1 export predates `combinable`, `table_ids` and `ends_at_utc`; §10 requires a new
+    service to accept it, so an absent (or `null`) optional column is filled here rather than
+    refused. `table_ids` is derived from `table_id`, and `ends_at_utc` from the reservation's own
+    restaurant duration and start, both inside the caller's transaction.
+    """
+    value = row.get(name)
+    if value is None and (table, name) in _STATE_OPTIONAL:
+        if (table, name) == ("reservations", "table_ids"):
+            table_id = row.get("table_id")
+            return json.dumps([table_id] if table_id else [])
+        if (table, name) == ("reservations", "ends_at_utc"):
+            starts = row.get("starts_at_utc")
+            restaurant = row.get("restaurant_id")
+            if starts and restaurant in durations:
+                return (dt.datetime.fromisoformat(starts)
+                        + dt.timedelta(minutes=durations[restaurant])).isoformat()
+            return None
+        return _STATE_OPTIONAL[(table, name)]
+    return value
+
+
+def _backfill_stage3(conn: sqlite3.Connection) -> None:
+    """Give a predecessor's imported rows the stage-3 shape import must still serve.
+
+    A stage-1 or stage-2 export carries no `accepted_terms` and no `reservation_history`. §10
+    requires import to accept it and stay a working service, so each such reservation is treated the
+    way `reset_database` treats a seeded one: revision 1, accepting policy 0, with one `created`
+    history entry. For our own stage-3 export every reservation already carries both, so this walks
+    the rows and changes nothing -- the round trip stays verbatim.
+    """
+    rows = conn.execute(
+        "SELECT reference, restaurant_id, table_id, table_ids, starts_at_local, party_size,"
+        " created_at, accepted_terms FROM reservations").fetchall()
+    for row in rows:
+        if row["accepted_terms"] is None:
+            conn.execute("UPDATE reservations SET accepted_terms = ? WHERE reference = ?",
+                         (json.dumps(policy_zero(conn, row["restaurant_id"])), row["reference"]))
+        if conn.execute("SELECT 1 FROM reservation_history WHERE reference = ? LIMIT 1",
+                        (row["reference"],)).fetchone() is not None:
+            continue
+        terms = conn.execute("SELECT accepted_terms FROM reservations WHERE reference = ?",
+                             (row["reference"],)).fetchone()["accepted_terms"]
+        table_ids = json.loads(row["table_ids"]) if row["table_ids"] else []
+        if not table_ids and row["table_id"]:
+            table_ids = [row["table_id"]]
+        changes = [{
+            "field": "table_id" if len(table_ids) == 1 else "table_ids",
+            "from": None, "to": table_ids[0] if len(table_ids) == 1 else table_ids,
+        }, {
+            "field": "starts_at_local", "from": None, "to": row["starts_at_local"],
+        }, {
+            "field": "party_size", "from": None, "to": row["party_size"],
+        }]
+        conn.execute(
+            "INSERT INTO reservation_history (reference, seq, at, event, changes, revision,"
+            " accepted_terms) VALUES (?, 1, ?, 'created', ?, 1, ?)",
+            (row["reference"], row["created_at"], json.dumps(changes), terms))
+
+
+def _validated_state(state: object) -> None:
+    """Every rule §10 states about a `state`, checked before any transaction is opened.
+
+    Two levels, and which one a bad object fails at is worth stating because it decides the
+    message: a `state` that is not an object, that does not carry `STATE_SCHEMA`, that is missing a
+    collection, or that holds a row which is not an object, is refused immediately -- it is not this
+    service's export and there is nothing to walk -- while everything *inside* a well-shaped row is
+    collected, so one object with two bad fields names both.
+
+    The type of every column is checked rather than assumed, and `int` excludes `bool`. That is not
+    fastidiousness: `sqlite3` binds a Python `True` as `1` without complaint, so an export claiming
+    `party_size: true` would be stored as a party of one and answer 201 for a booking nobody asked
+    for. §10:170 says an invalid state is 422, and the only place to notice is before the write.
+
+    The same argument settles why `_check_state_keys` and `_check_state_references` are here rather
+    than left to the database. A row that repeats a primary key, or a token naming a user the state
+    does not contain, is invalid state on the plainest reading available; asked of `sqlite3` instead
+    it comes back as an `IntegrityError` from inside the write, which the handler answers as
+    `500 internal_error`. §10:170 wants 422 and REQUIREMENTS.md:17 rules out the 5xx unconditionally,
+    so the constraint has to be known before the transaction opens rather than discovered inside it.
+
+    Value rules §4 states about a *fixture* are deliberately not restated here. A `state` is not
+    authored by a caller from the specification -- §10 makes it opaque and requires import to accept
+    an unchanged export of ours -- so there is nothing to validate a length against; refusing a
+    state our own export produced would break the round trip the section is built on.
+    """
+    if not isinstance(state, dict):
+        raise InvalidState("state must be a JSON object")
+    if state.get("schema") not in _STATE_SCHEMAS:
+        raise InvalidState(f"state.schema must be one of {_STATE_SCHEMAS!r}")
+
+    bad = _Violations()
+    rows: dict[str, list[dict]] = {}
+    for table, spec in _STATE_TABLES_SPEC.items():
+        entries = state.get(table)
+        if table in _STATE_OPTIONAL_TABLES and table not in state:
+            rows[table] = []
+            continue
+        if not isinstance(entries, list):
+            raise InvalidState(f"state.{table} must be an array")
+        rows[table] = []
+        for index, row in enumerate(entries):
+            path = f"state.{table}[{index}]"
+            if not isinstance(row, dict):
+                raise InvalidState(f"{path} must be an object")
+            for column, kind in spec:
+                if (table, column) in _STATE_OPTIONAL and column not in row:
+                    continue
+                value = row.get(column)
+                if value is None and (table, column) in _STATE_NULLABLE:
+                    continue
+                if kind is int:
+                    # `bool` is an `int` in Python and binds as 1, so it has to be named out.
+                    usable = isinstance(value, int) and not isinstance(value, bool)
+                else:
+                    usable = isinstance(value, str)
+                if not usable:
+                    bad.add(f"{path}.{column} must be "
+                            + ("an integer" if kind is int else "a string"))
+            rows[table].append(row)
+    _check_state_keys(rows, bad)
+    _check_state_references(rows, bad)
+    if bad:
+        raise InvalidState(bad.text)
+
+
+def _check_state_keys(rows: dict[str, list[dict]], bad: _Violations) -> None:
+    """No two rows of one table may carry the same value for a key `_STATE_UNIQUE_KEYS` names.
+
+    Every column is read with `.get`, so a row that is missing one is *also* named here rather than
+    raising `KeyError` -- it is already a violation the type pass recorded, and this function must not
+    be the thing that turns a reportable state into a 500.
+    """
+    for table, keys in _STATE_UNIQUE_KEYS.items():
+        for key in keys:
+            seen: set[tuple[object, ...]] = set()
+            for row in rows[table]:
+                value = tuple(row.get(column) for column in key)
+                if value in seen:
+                    bad.add(f"state.{table} repeats {'+'.join(key)} {value!r}")
+                seen.add(value)
+
+
+def _check_state_references(rows: dict[str, list[dict]], bad: _Violations) -> None:
+    """No row may name a parent row that the same `state` does not contain.
+
+    The parent values are collected across every table first rather than as each table is walked, so
+    this does not depend on `_STATE_TABLES_SPEC` happening to list parents before children -- an
+    ordering `_STATE_TABLES_SPEC` does need for its inserts, but which has no business being a second,
+    invisible constraint on where a validation pass may be placed.
+    """
+    known: dict[tuple[str, str], set[object]] = {}
+    for table, keys in _STATE_UNIQUE_KEYS.items():
+        for key in keys:
+            for column in key:
+                known[(table, column)] = {row.get(column) for row in rows[table]}
+    for table, references in _STATE_FOREIGN_KEYS.items():
+        for column, parent, parent_column in references:
+            available = known.get((parent, parent_column), set())
+            for row in rows[table]:
+                value = row.get(column)
+                if value not in available:
+                    bad.add(f"state.{table}.{column} {value!r} names no {parent}.{parent_column}")
+
+
+def ensure_schema() -> None:
+    """Create tables if absent, and carry an older database forward. Idempotent.
+
+    Safe to call on every start, which is what `serve()` does: `CREATE TABLE IF NOT EXISTS` only
+    creates what is missing, so the four migrations below are what make a *changed* declaration take
+    effect on a database that already exists.
+
+    **`SCHEMA` is applied in two halves, and the split is load-bearing.** `tables_by_ordinal` and
+    `opening_hours_by_ordinal` index columns that a database written before this change does not
+    have, so applying the whole declaration first would fail with `no such column: ordinal` on exactly
+    the legacy database the migration exists to repair. The indexes therefore run *after*
+    `_add_table_fixture_ordinals` and `_add_opening_hours_fixture_ordinals` have added their columns,
+    rather than being tolerated in a try/except: a swallowed failure here would leave the index missing
+    on every future start, and nothing would report it.
+
+    **The key widening and the column additions are separate migrations on purpose, and the order is
+    what makes each one's guard sufficient.** A read that concludes "the key is already composite" is
+    not a read that concludes "nothing is left to do", and collapsing the two into one guard is how a
+    database that already passed the widening would skip the backfill forever -- the failure this
+    file's own warning describes, arriving through a fix. Measured on all three shapes a legacy file
+    can have: global `id` key goes through the widen, whose `ROW_NUMBER() OVER (...)` already writes
+    sequential ordinals, so the column migration then finds the column present and does nothing;
+    composite key with no ordinal goes past the widen's guard untouched and is repaired by
+    `_add_table_fixture_ordinals`, which tests for the *column*; composite key with the column is left
+    alone entirely.
+    """
+    conn = connect()
+    try:
+        conn.executescript(SCHEMA_TABLES)
+        _widen_tables_key_to_the_restaurant(conn)
+        _widen_idempotency_for_path_scoping(conn)
+        _add_table_fixture_ordinals(conn)
+        _add_opening_hours_fixture_ordinals(conn)
+        _add_stage2_columns(conn)
+        _add_stage3_columns(conn)
+        conn.executescript(SCHEMA_INDEXES)
+    finally:
+        conn.close()
+
+
+def _add_stage2_columns(conn: sqlite3.Connection) -> None:
+    """Add the columns stage 2 introduces and backfill them for an existing database.
+
+    A database written by stage 1 has no `combinable`, no `table_ids` and no `ends_at_utc`. A
+    single-table reservation's set is its one table, and its end is the restaurant's duration past
+    its start, so both are derivable and neither is guessed.
+    """
+    restaurant_columns = {row[1] for row in conn.execute("PRAGMA table_info(restaurants)")}
+    if "combinable" not in restaurant_columns:
+        conn.execute("ALTER TABLE restaurants ADD COLUMN combinable TEXT NOT NULL DEFAULT '[]'")
+
+    reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if "table_ids" not in reservation_columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN table_ids TEXT NOT NULL DEFAULT '[]'")
+    if "ends_at_utc" not in reservation_columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN ends_at_utc TEXT")
+
+    durations = {row[0]: row[1] for row in
+                 conn.execute("SELECT id, reservation_duration_minutes FROM restaurants")}
+    rows = conn.execute("SELECT reference, restaurant_id, table_id, table_ids,"
+                        " starts_at_utc, ends_at_utc FROM reservations").fetchall()
+    for row in rows:
+        table_ids = row["table_ids"]
+        ends_at_utc = row["ends_at_utc"]
+        set_parts: list[str] = []
+        values: list[object] = []
+        if not table_ids or table_ids == "[]":
+            set_parts.append("table_ids = ?")
+            values.append(json.dumps([row["table_id"]]))
+        if not ends_at_utc and row["starts_at_utc"]:
+            duration = durations.get(row["restaurant_id"])
+            if duration is not None:
+                set_parts.append("ends_at_utc = ?")
+                values.append((dt.datetime.fromisoformat(row["starts_at_utc"])
+                               + dt.timedelta(minutes=duration)).isoformat())
+        if set_parts:
+            values.append(row["reference"])
+            conn.execute(f"UPDATE reservations SET {', '.join(set_parts)} WHERE reference = ?",
+                         values)
+
+
+def _add_stage3_columns(conn: sqlite3.Connection) -> None:
+    """Add the columns and backfills stage 3 introduces, for a database written by stage 2.
+
+    A stage-2 database has no managers, no policies, no reservation revision or accepted terms
+    and no series. The new tables come from `CREATE TABLE IF NOT EXISTS`; the new columns need
+    `ALTER TABLE`. Every reservation is revision 1 under policy 0, so its accepted terms are the
+    original fixture rules - which is what `policy_zero` renders.
+    """
+    restaurant_columns = {row[1] for row in conn.execute("PRAGMA table_info(restaurants)")}
+    for name, ddl in (
+        ("manager_user_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ("policy_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("restaurant_revision", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in restaurant_columns:
+            conn.execute(f"ALTER TABLE restaurants ADD COLUMN {name} {ddl}")
+
+    reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+    for name, ddl in (
+        ("revision", "INTEGER NOT NULL DEFAULT 1"),
+        ("accepted_terms", "TEXT"),
+        ("series_id", "TEXT"),
+        ("series_index", "INTEGER"),
+        ("exception", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in reservation_columns:
+            conn.execute(f"ALTER TABLE reservations ADD COLUMN {name} {ddl}")
+
+
+def _widen_tables_key_to_the_restaurant(conn: sqlite3.Connection) -> None:
+    """Carry `tables` across from the global-`id` shape, without losing a row.
+
+    The same problem `_widen_idempotency_for_path_scoping` solves, and the same reason it is not
+    solved by `ALTER TABLE`: SQLite cannot widen a primary key, so the table is rebuilt -- renamed
+    aside, the current DDL reissued, the rows copied across, and only then the old table dropped.
+
+    It matters here because `CREATE TABLE IF NOT EXISTS` is silent about a table that already
+    exists in the *old* shape. Without this, the composite key in `SCHEMA` applies only to a
+    database created after the change: a shipped database, or one on a volume that survives a
+    restart, keeps `id` globally unique and every fixture the specification permits still dies at
+    reset -- the fix would read as landed and do nothing.
+
+    **Nothing is lost and nothing is deduplicated.** The old key forbade a table id appearing
+    twice anywhere, so the copy cannot collide, and the rebuild is the one place a row could
+    disappear -- hence copy, then drop.
+
+    **The shape is read inside the write lock, not before it.** Same reasoning as the idempotency
+    migration below, and for the same reason it was wrong there first: read outside the
+    transaction and a second process blocks on `BEGIN IMMEDIATE` holding a decision it made about
+    a table the first one has already rebuilt. The rebuild is idempotent, so the damage here is
+    bounded to doing it twice -- but a migration that reads its own precondition under a lock is
+    the invariant, and it is worth one uncontended `BEGIN`/`COMMIT` per start to keep.
+
+    A process killed mid-migration rolls back to the old table intact and the next start tries
+    again; there is no window in which `tables` does not exist.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        info = list(conn.execute("PRAGMA table_info(tables)"))
+        if not info:
+            conn.execute("COMMIT")
+            return
+        # `pk` is the 1-based position in the primary key, 0 for a plain column.
+        primary_key = [row["name"] for row in sorted(info, key=lambda row: row["pk"]) if row["pk"]]
+        if primary_key == ["restaurant_id", "id"]:
+            conn.execute("COMMIT")
+            return
+
+        conn.execute("ALTER TABLE tables RENAME TO tables__pre_restaurant_key")
+        conn.execute(TABLES_DDL)
+        conn.execute(
+            "INSERT INTO tables (restaurant_id, id, label, capacity, ordinal)"
+            " SELECT restaurant_id, id, label, capacity,"
+            " ROW_NUMBER() OVER (PARTITION BY restaurant_id ORDER BY id) - 1"
+            " FROM tables__pre_restaurant_key")
+        conn.execute("DROP TABLE tables__pre_restaurant_key")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _add_table_fixture_ordinals(conn: sqlite3.Connection) -> None:
+    """Give `tables` an `ordinal` recording its position in its restaurant's fixture array.
+
+    §8:112 asks for `available_table_ids` "in fixture order" in as many words, and sorting by `id`
+    answers a different question -- alphabetical -- which coincides with fixture order only on a
+    fixture whose ids are already sorted. `ALTER TABLE ... ADD COLUMN` is enough: the column is
+    `NOT NULL DEFAULT 0`, which SQLite permits on a table that already has rows, so unlike the
+    primary-key widenings above this needs no rebuild and cannot lose a row.
+
+    **Only `tables`, and `opening_hours` is the twin -- but `restaurants` is not.** §8:112 asks for
+    `available_table_ids` "in fixture order" in as many words and §8:101 returns `tables` and
+    `opening_hours` "in the fixture's shape", which this repository reads as order and has two named
+    red defects for. §8:99 asks for something else: `GET /restaurants` is pinned to
+    `{"restaurants":[{id,name,timezone}]}` and **nothing else**. No order, no "fixture's shape".
+
+    That is not only an absence in the prose, and the measurement is worth keeping because the
+    argument has been made twice in this room on citation alone. The shipped
+    `test_restaurants_list_envelope` has four legs -- envelope shape, two seeded restaurants listed,
+    every entry carrying `id`/`name`/`timezone` -- and **not one of them mentions order**. The name is
+    red for the envelope: the handler returns a bare list. Alphabetising it is therefore not a defect
+    this suite can fail and not a requirement the specification makes.
+
+    The cost is also concrete rather than theoretical: `tests/test_store_schema.py:156` writes
+    `INSERT INTO restaurants VALUES ('r_one','One','Europe/Berlin',30,90,120)` positionally against
+    six columns. A seventh column makes that raise `table restaurants has 7 columns but 6 values were
+    supplied`, so the column would break a shipped test on the way in.
+
+    If restaurant order is ever wanted it is one column and one migration, and it should be argued for
+    on the specification rather than smuggled in beside a requirement that does need it.
+
+    **The backfill is deterministic but it is not the truth, and that is fine.** A row's real ordinal
+    lived only in the JSON array that produced it, and that array is gone -- so for a database
+    written before this column the best available answer is *some* fixed order, and `(restaurant_id,
+    id)` gives the same one on every machine. That looked like a hazard until `reset` was taken into
+    account: `reset_database` deletes every row of all seven tables and rewrites them from the
+    fixture in array order, so `tables` rows exist *only* as a product of a reset. A pre-ordinal
+    database is one built by an older binary and never reset since, and no API can observe its
+    ordinals, because the first reset converges them to true fixture order. Two databases with
+    identical logical content returning different orderings is therefore not reachable through the
+    service, and the backfill only has to be stable, not faithful.
+
+    **The unique index is created after the backfill, not before.** Created first, it would fail:
+    every row would still hold the `DEFAULT 0`, and `(restaurant_id, 0)` collides on the second table
+    of a restaurant.
+
+    **The shape is read inside the write lock, not before it.** Same invariant, and the same reason
+    it was wrong twice already in this file: read outside the transaction and a second process blocks
+    on `BEGIN IMMEDIATE` while holding a decision made about a table the first one has already
+    altered. The rebuild is idempotent, so the damage is bounded to doing it twice -- but reading a
+    migration's own precondition under the lock it holds is the invariant, and it is worth one
+    uncontended `BEGIN`/`COMMIT` per start to keep.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        info = list(conn.execute("PRAGMA table_info(tables)"))
+        if info and "ordinal" not in {row["name"] for row in info}:
+            conn.execute("ALTER TABLE tables ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0")
+            # Assigned in Python rather than with `ROW_NUMBER() OVER (...)`: SQLite rejects a window
+            # function directly in an UPDATE's SET, and a correlated subquery would make this depend
+            # on a window-function-capable SQLite to count the rows of a fixture-sized table.
+            seen: dict[str, int] = {}
+            for group, identifier in conn.execute(
+                    "SELECT restaurant_id, id FROM tables ORDER BY restaurant_id, id"
+            ):
+                position = seen.get(group, 0)
+                seen[group] = position + 1
+                conn.execute(
+                    "UPDATE tables SET ordinal = ? WHERE restaurant_id = ? AND id = ?",
+                    (position, group, identifier),
+                )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _add_opening_hours_fixture_ordinals(conn: sqlite3.Connection) -> None:
+    """Give `opening_hours` an `ordinal` recording its position in its restaurant's fixture array.
+
+    The twin of `_add_table_fixture_ordinals`, and it exists for the same reason: §8:101 returns
+    `opening_hours` "in the fixture's shape", `ORDER BY weekday` answers a different question --
+    alphabetical -- and on a fixture written `sat, mon, fri` the two disagree, which is exactly the
+    shipped `opening_hours_in_fixture_order`. `ALTER TABLE ... ADD COLUMN` is enough, because the
+    column is `NOT NULL DEFAULT 0` and SQLite permits that on a table that already has rows: no
+    rebuild, and so no way to lose one.
+
+    **The backfill is ordered by content, not by rowid.** `(restaurant_id, weekday, opens, closes)`
+    gives the same answer for the same logical rows on every machine and in every file. Ordering by
+    `rowid` would tie-break identically-identical rows by insertion accident, which is the property
+    this column exists to stop depending on.
+
+    **Two byte-identical rows are the one case the backfill cannot separate**, and it is left
+    standing rather than repaired: they receive one shared ordinal, which is why
+    `opening_hours_by_ordinal` is a plain index. Deduplicating would silently delete configuration a
+    fixture asked for, and §10:172 requires import to preserve fixture configuration rather than
+    renormalise it. The rows render identically, so nothing observable depends on which comes first.
+
+    **The backfill is deterministic but it is not the truth, and that is fine** -- the same argument
+    as `_add_table_fixture_ordinals`, and it rests on the same measured fact: `reset_database` deletes
+    every row of all seven tables and rewrites them from the fixture in array order, so these rows
+    exist *only* as a product of a reset. A pre-ordinal database is one written by an older binary and
+    never reset since, and the first reset converges it to true fixture order, so no API can observe
+    the backfilled values. Stable is the whole requirement; faithful is unavailable.
+
+    **The shape is read inside the write lock**, for the same reason as the two migrations above it:
+    a decision made outside `BEGIN IMMEDIATE` is stale by the time the lock is granted.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        info = list(conn.execute("PRAGMA table_info(opening_hours)"))
+        if info and "ordinal" not in {row["name"] for row in info}:
+            conn.execute("ALTER TABLE opening_hours ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0")
+            # Assigned in Python rather than with `ROW_NUMBER() OVER (...)`: SQLite rejects a window
+            # function directly in an UPDATE's SET, and this keeps the file dependent on nothing newer
+            # than a plain cursor for a fixture-sized table.
+            seen: dict[str, int] = {}
+            for row in conn.execute(
+                    "SELECT restaurant_id, weekday, opens, closes FROM opening_hours"
+                    " ORDER BY restaurant_id, weekday, opens, closes"
+            ):
+                group = row["restaurant_id"]
+                position = seen.get(group, 0)
+                seen[group] = position + 1
+                conn.execute(
+                    "UPDATE opening_hours SET ordinal = ?"
+                    " WHERE restaurant_id = ? AND weekday = ? AND opens = ? AND closes = ?",
+                    (position, row["restaurant_id"], row["weekday"], row["opens"], row["closes"]),
+                )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+#: The scope every receipt written before §7:79 must carry after the upgrade. `POST /reservations`
+#: was the only idempotency-required path in the service when such a receipt was written --
+#: `POST /reservation-moves` did not exist -- and `Request.idempotency_scope` builds
+#: `"{METHOD} {path}"` from a path with its query string already stripped, so `/reservations` is the
+#: only path a pre-moves create could have recorded. Anything else would answer 409
+#: `idempotency_key_reuse` to a legitimate retry, or silently treat it as a first use.
+_PRE_SCOPE_RESERVATIONS_SCOPE = "POST /reservations"
+
+
+def _widen_idempotency_for_path_scoping(conn: sqlite3.Connection) -> None:
+    """Carry `idempotency` across from the pre-§7:79 shape, without losing a receipt.
+
+    `CREATE TABLE IF NOT EXISTS` cannot widen an existing table, so a database written before moves
+    existed still carries the old `(key, user_id)` primary key and no `scope` column, and every
+    insert against the new schema would fail for want of the column. Widening a primary key is the
+    one thing SQLite cannot do with `ALTER TABLE`, so the table is rebuilt -- renamed aside, the
+    current DDL reissued, the rows copied across, and only then the old table dropped.
+
+    Two orders are load-bearing, and only one of them was right at first.
+
+    **Copy, then drop.** The receipts are copied before anything is destroyed, so no failure between
+    the two can lose one.
+
+    **Read the shape inside the transaction, not before it.** The rebuild, the `PRAGMA table_info`
+    that decides whether it is needed, and the backfill constant derived from that read all happen
+    under the same `BEGIN IMMEDIATE`. Read the shape first and the decision is stale the moment it
+    is made: a second process starting on the same database reads "no `scope` column", blocks on
+    `BEGIN IMMEDIATE` until the first one commits, and then rebuilds the *already-migrated* table
+    with the backfill constant it chose before the lock -- rewriting every `POST /reservation-moves`
+    receipt to `POST /reservations`. The row survives, so nothing looks lost, but it can never be
+    found again on its own path: a replay of that batch becomes a first use, and §11:201's batch
+    applies a second time. Inside the transaction the second process reads the committed shape, sees
+    nothing to do, and leaves every scope alone.
+
+    The price is that `ensure_schema` now takes the write lock on every start, even on a database
+    already in the new shape. That is one uncontended `BEGIN`/`COMMIT` per process start against a
+    ten-second `busy_timeout`, which is cheaper than the receipt rewrite it prevents.
+
+    A process killed mid-migration still rolls back to the old table intact and the next start tries
+    again -- there is no window in which `idempotency` does not exist.
+
+    Receipts are not derived state in the way the previous version of this function claimed. No
+    domain row references them, true, but §7 makes a client depend on one directly: :86/:92 owe it
+    the original response, and a key with no receipt is a first use, which for a create is a second
+    booking. That is why nothing here drops a row.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        info = list(conn.execute("PRAGMA table_info(idempotency)"))
+        if not info:
+            conn.execute("COMMIT")
+            return
+        columns = {row["name"] for row in info}
+        # `pk` is the 1-based position in the primary key, 0 for a plain column.
+        primary_key = [row["name"] for row in sorted(info, key=lambda row: row["pk"]) if row["pk"]]
+        if "scope" in columns and primary_key == ["key", "user_id", "scope"]:
+            conn.execute("COMMIT")
+            return
+
+        # A table that already has `scope` keeps whatever it says; one that does not is backfilled,
+        # because a receipt whose scope cannot be recovered is a receipt that will never replay.
+        scope_source = "scope" if "scope" in columns else "?"
+        params = () if "scope" in columns else (_PRE_SCOPE_RESERVATIONS_SCOPE,)
+        conn.execute("ALTER TABLE idempotency RENAME TO idempotency__pre_scope")
+        conn.execute(IDEMPOTENCY_DDL)
+        conn.execute(
+            "INSERT INTO idempotency (key, user_id, scope, request_hash, status_code,"
+            " response_body) SELECT key, user_id, " + scope_source + ", request_hash, status_code,"
+            " response_body FROM idempotency__pre_scope", params)
+        conn.execute("DROP TABLE idempotency__pre_scope")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
