@@ -118,12 +118,19 @@ they are re-derivable):
 
 | Measurement | Value |
 |---|---|
-| Repository lifetime | 2026-10-02 → 2026-10-08 (six days) |
+| Repository lifetime | 2026-10-02 → 2026-10-10 (nine days) |
 | Commits | `git rev-list --count HEAD`, authors distinguishable per seat |
-| Stage-1 suite, in the folder | 272 tests plus 146 subtests, ≈275 s wall clock, 0 failures |
-| Official harness, stage 1, `--base-url` | **120 collected, 120 passed, 0 failed, 310.80 s** |
-| Official harness, stage 2 against `stage-1/` | 23 failed, 1 passed, 1 error, 271.85 s — the correct negative result: `stage-1/` holds no stage-2 surface |
-| Offline gates (`harness check`) | gates 1, 2 and the mandate half of gate 4 pass; `room.json` is the only open item |
+| Stage-1 in-folder suite | **272 tests, ≈276 s wall clock, 0 failures, 0 errors, 0 skipped** |
+| Stage-2 in-folder suite | **272 tests green** (stage-2 app against the stage-1/2 spec gates) |
+| Stage-3 in-folder suite | **272 tests green** (stage-3 app against the stage-1/2 spec gates) |
+| Stage-4 in-folder suite | **272 tests green** (stage-4 app against the stage-1/2 spec gates, 435.9 s) |
+| Official harness, stage 1 (`--base-url`) | **120 collected / 120 passed / 0 failed / 0 skipped** |
+| Official harness, stage 2 | **25 collected / 25 passed / 0 failed** (8 API + 17 UI) |
+| Official harness, stage 3 | **7 collected / 7 passed / 0 failed** |
+| Official harness, stage 4 | **6 collected / 6 passed / 0 failed** |
+| Official harness, full chain against `stage-4/` | suites 1+2+3+4 all green (120 + 25 + 7 + 6) |
+| Offline gates (`harness check`) | gates 1, 2 and the mandate half of gate 4 pass; `room.json` is the only open item (human-supplied) |
+| Container build (all stages) | **UNVERIFIED — Docker is not installed on this host** |
 | Runtime dependencies | none (Python standard library) |
 | Model spend | `band usage` reports *no usage recorded* for this machine; nothing in the repository records token usage either |
 
@@ -190,10 +197,32 @@ because they changed the design rather than being worked around:
 
 ## 7. Current status
 
-The status table in `README.md` is authoritative for which stages exist and what
-has been verified; this file should not be read as a claim that all four stages
-are complete. Anything marked unverified here is unverified because the tool
-that would verify it was unavailable, not because it was attempted and skipped.
+**All four stages are implemented and present** — `stage-1/`, `stage-2/`,
+`stage-3/` and `stage-4/`, each a self-contained buildable service with its own
+`Dockerfile` and `RUN.md` — and the repository is pushed to its public remote.
+
+Measured verification, all re-derivable from §5:
+
+- All four shipped harness suites pass: **120/120** (stage 1), **25/25**
+  (stage 2), **7/7** (stage 3), **6/6** (stage 4), and the full chain run against
+  `stage-4/` is green for suites 1+2+3+4.
+- Each stage folder also passes the team's 272-test in-folder spec suite,
+  confirming no stage regressed an earlier one.
+- `python -m harness check` passes gates 1, 2 and the mandate half of gate 4.
+
+Two items are open, and both are stated rather than glossed:
+
+- **`room.json` is missing.** It is the room downloaded from Band as a full
+  session, which only the human console can produce; no seat can generate it, and
+  fabricating one would defeat its purpose. It is the single `harness check`
+  problem. See `README.md` for the export steps.
+- **The container build is unverified.** Docker is not installed on the build
+  host, so the `harness run --repo` (container) path was not exercised. The same
+  shipped suites were run against locally started services instead, which gives
+  identical assertions over a different transport; see §3.
+
+Anything marked unverified here is unverified because the tool that would verify
+it was unavailable, not because it was attempted and skipped.
 
 ---
 
