@@ -153,8 +153,9 @@ class RestaurantScopedTableKey(unittest.TestCase):
         store.ensure_schema()
         conn = sqlite3.connect(self.db)
         try:
-            conn.execute("INSERT INTO restaurants VALUES ('r_one', 'One', 'Europe/Berlin',"
-                         " 30, 90, 120)")
+            conn.execute("INSERT INTO restaurants (id, name, timezone, slot_minutes,"
+                         " reservation_duration_minutes, cancellation_cutoff_minutes)"
+                         " VALUES ('r_one', 'One', 'Europe/Berlin', 30, 90, 120)")
             conn.execute("INSERT INTO tables (restaurant_id, id, label, capacity)"
                          " VALUES ('r_one', 't_1', '1', 2)")
             conn.commit()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import json
 import os
 import pathlib
 import re
@@ -156,16 +157,19 @@ CREATE TABLE IF NOT EXISTS restaurants (
     timezone                     TEXT NOT NULL,
     slot_minutes                 INTEGER NOT NULL,
     reservation_duration_minutes INTEGER NOT NULL,
-    cancellation_cutoff_minutes  INTEGER NOT NULL
+    cancellation_cutoff_minutes  INTEGER NOT NULL,
+    combinable                   TEXT NOT NULL DEFAULT '[]'
 );
 """ + TABLES_DDL + OPENING_HOURS_DDL + """
 CREATE TABLE IF NOT EXISTS reservations (
     reference       TEXT PRIMARY KEY,
     restaurant_id   TEXT NOT NULL,
     table_id        TEXT NOT NULL,
+    table_ids       TEXT NOT NULL DEFAULT '[]',
     user_id         TEXT NOT NULL,
     starts_at_utc   TEXT NOT NULL,
     starts_at_local TEXT NOT NULL,
+    ends_at_utc     TEXT,
     party_size      INTEGER NOT NULL,
     status          TEXT NOT NULL,
     created_at      TEXT NOT NULL
@@ -453,6 +457,7 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
             _text(user["display_name"], f"{path}.display_name", bad)
 
     zones: dict[str, str] = {}
+    known_tables: set[tuple[str, str]] = set()
     seen_restaurant_ids: set[str] = set()
     for index, restaurant_row in _entries(fixture, "restaurants", bad):
         path = f"restaurants[{index}]"
@@ -503,9 +508,34 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
             if restaurant_id is not None and table_id is not None:
                 if (restaurant_id, table_id) in seen_tables:
                     bad.add(f"{table_path}.id duplicates a table already in this restaurant")
+            if restaurant_id is not None and table_id is not None:
+                known_tables.add((restaurant_id, table_id))
             seen_tables.add((restaurant_id, table_id))
             _text(table_row.get("label"), f"{table_path}.label", bad)
             _positive(table_row.get("capacity"), f"{table_path}.capacity", bad)
+
+        combinable = restaurant_row.get("combinable", [])
+        if combinable is None:
+            combinable = []
+        if not isinstance(combinable, list):
+            bad.add(f"{path}.combinable must be an array")
+        else:
+            seen_pairs: set[frozenset[str]] = set()
+            for pair_index, pair in enumerate(combinable):
+                pair_path = f"{path}.combinable[{pair_index}]"
+                if (not isinstance(pair, list) or len(pair) != 2
+                        or any(not isinstance(member, str) or not member for member in pair)):
+                    bad.add(f"{pair_path} must be an array of exactly two table ids")
+                    continue
+                if pair[0] == pair[1]:
+                    bad.add(f"{pair_path} names the same table twice")
+                for member in pair:
+                    if restaurant_id is not None and (restaurant_id, member) not in known_tables:
+                        bad.add(f"{pair_path} names a table that is not in this restaurant")
+                key = frozenset(pair)
+                if key in seen_pairs:
+                    bad.add(f"{pair_path} repeats a combination already in this restaurant")
+                seen_pairs.add(key)
 
     instants: dict[int, str] = {}
     seen_references: set[str] = set()
@@ -523,7 +553,27 @@ def _validated_fixture(fixture: dict) -> tuple[dict[str, str], dict[int, str]]:
         known = restaurant_id is not None and restaurant_id in zones
         if restaurant_id is not None and not known:
             bad.add(f"{path}.restaurant_id must name a restaurant in this fixture")
-        _text(reservation.get("table_id"), f"{path}.table_id", bad)
+        table_id = reservation.get("table_id")
+        table_ids = reservation.get("table_ids")
+        if table_id is not None and table_ids is not None:
+            bad.add(f"{path} must not carry both table_id and table_ids")
+        elif table_ids is not None:
+            if (not isinstance(table_ids, list) or not table_ids
+                    or any(not isinstance(member, str) or not member for member in table_ids)):
+                bad.add(f"{path}.table_ids must be a non-empty array of table ids")
+            elif len(table_ids) > 2:
+                bad.add(f"{path}.table_ids must name at most two tables")
+            else:
+                if len(set(table_ids)) != len(table_ids):
+                    bad.add(f"{path}.table_ids names the same table twice")
+                if known:
+                    for member in table_ids:
+                        if (restaurant_id, member) not in known_tables:
+                            bad.add(f"{path}.table_ids names a table that is not in this"
+                                    " restaurant")
+                            break
+        else:
+            _text(table_id, f"{path}.table_id", bad)
         _identifier(reservation.get("user_id"), f"{path}.user_id", bad)
         _positive(reservation.get("party_size"), f"{path}.party_size", bad)
         if known:
@@ -568,11 +618,12 @@ def reset_database(fixture: dict) -> None:
         for restaurant in fixture.get("restaurants", []):
             conn.execute(
                 "INSERT INTO restaurants (id, name, timezone, slot_minutes,"
-                " reservation_duration_minutes, cancellation_cutoff_minutes)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                " reservation_duration_minutes, cancellation_cutoff_minutes, combinable)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (restaurant["id"], restaurant["name"], restaurant["timezone"],
                  restaurant["slot_minutes"], restaurant["reservation_duration_minutes"],
-                 restaurant["cancellation_cutoff_minutes"]),
+                 restaurant["cancellation_cutoff_minutes"],
+                 json.dumps(restaurant.get("combinable", []))),
             )
             for hours_ordinal, hours in enumerate(restaurant.get("opening_hours", [])):
                 conn.execute(
@@ -589,14 +640,30 @@ def reset_database(fixture: dict) -> None:
                      table_ordinal),
                 )
 
+        durations = {restaurant["id"]: restaurant["reservation_duration_minutes"]
+                     for restaurant in fixture.get("restaurants", [])}
         for index, reservation in enumerate(fixture.get("reservations", [])):
+            table_id = reservation.get("table_id")
+            if table_id is None:
+                table_ids = list(reservation["table_ids"])
+                table_id = table_ids[0]
+            else:
+                table_ids = list(reservation.get("table_ids") or [table_id])
+            starts_at_utc = instants[index]
+            ends_at_utc = reservation.get("ends_at_utc")
+            if ends_at_utc is None:
+                ends_at_utc = (
+                    dt.datetime.fromisoformat(starts_at_utc)
+                    + dt.timedelta(minutes=durations[reservation["restaurant_id"]])
+                ).isoformat()
             conn.execute(
-                "INSERT INTO reservations (reference, restaurant_id, table_id, user_id,"
-                " starts_at_utc, starts_at_local, party_size, status, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO reservations (reference, restaurant_id, table_id, table_ids,"
+                " user_id, starts_at_utc, starts_at_local, ends_at_utc, party_size, status,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (reservation["reference"], reservation["restaurant_id"],
-                 reservation["table_id"], reservation["user_id"],
-                 instants[index], reservation["starts_at_local"], reservation["party_size"],
+                 table_id, json.dumps(table_ids), reservation["user_id"],
+                 starts_at_utc, reservation["starts_at_local"], ends_at_utc,
+                 reservation["party_size"],
                  reservation.get("status", "confirmed"),
                  reservation.get("created_at", dt.datetime.now(dt.timezone.utc).isoformat())),
             )
@@ -640,7 +707,12 @@ EXPORT_FORMAT_VERSION = 1
 #: It is a *marker*, not a compatibility promise. Bumping the schema is a deliberate migration, and
 #: the honest form of one is to teach `_validated_state` the old shape beside the new -- not to
 #: accept a shape and hope.
-STATE_SCHEMA = "tablekeeper/state/1"
+STATE_SCHEMA = "tablekeeper/state/2"
+
+#: Schemas import still accepts. A stage-1 export has no `combinable`, no `table_ids` and no
+#: `ends_at_utc`; §10 requires a new service to accept a state its predecessor exported, so those
+#: three columns are optional on the way in and filled with their defaults here.
+_STATE_SCHEMAS = ("tablekeeper/state/1", "tablekeeper/state/2")
 
 #: Every state table, with the columns an export writes and an import reads back, and the JSON type
 #: each column must hold. One structure for all three jobs on purpose: the column list an export
@@ -656,17 +728,29 @@ _STATE_TABLES_SPEC: dict[str, tuple[tuple[str, type], ...]] = {
     "users": (("id", str), ("email", str), ("password_hash", str), ("display_name", str)),
     "tokens": (("token", str), ("user_id", str)),
     "restaurants": (("id", str), ("name", str), ("timezone", str), ("slot_minutes", int),
-                    ("reservation_duration_minutes", int), ("cancellation_cutoff_minutes", int)),
+                    ("reservation_duration_minutes", int), ("cancellation_cutoff_minutes", int),
+                    ("combinable", str)),
     "opening_hours": (("restaurant_id", str), ("weekday", str), ("opens", str), ("closes", str),
                       ("ordinal", int)),
     "tables": (("restaurant_id", str), ("id", str), ("label", str), ("capacity", int),
                ("ordinal", int)),
     "reservations": (("reference", str), ("restaurant_id", str), ("table_id", str),
-                     ("user_id", str), ("starts_at_utc", str), ("starts_at_local", str),
-                     ("party_size", int), ("status", str), ("created_at", str)),
+                     ("table_ids", str), ("user_id", str), ("starts_at_utc", str),
+                     ("starts_at_local", str), ("ends_at_utc", str), ("party_size", int),
+                     ("status", str), ("created_at", str)),
     "idempotency": (("key", str), ("user_id", str), ("scope", str), ("request_hash", str),
                     ("status_code", int), ("response_body", str)),
 }
+
+#: Columns a stage-1 export does not carry, and the value to use when a state omits one.
+_STATE_OPTIONAL: dict[tuple[str, str], object] = {
+    ("restaurants", "combinable"): "[]",
+    ("reservations", "table_ids"): None,
+    ("reservations", "ends_at_utc"): None,
+}
+
+#: Columns a `state` may legitimately carry as JSON `null`.
+_STATE_NULLABLE: frozenset[tuple[str, str]] = frozenset({("reservations", "ends_at_utc")})
 
 #: The order a replacement empties the tables in, and it is not the insert order reversed by habit
 #: but the order the foreign keys force: every child has to go before its parent, because
@@ -840,16 +924,43 @@ def import_state(state: object) -> None:
     with transaction() as conn:
         for table in _STATE_DELETE_ORDER:
             conn.execute(f"DELETE FROM {table}")
+        durations = {restaurant["id"]: restaurant["reservation_duration_minutes"]
+                     for restaurant in state["restaurants"]}
         for table, spec in _STATE_TABLES_SPEC.items():
             names = [name for name, _ in spec]
             placeholders = ", ".join("?" * len(names))
             statement = (f"INSERT INTO {table} ({', '.join(names)}) VALUES ({placeholders})")
             try:
                 for row in state[table]:
-                    conn.execute(statement, tuple(row[name] for name in names))
+                    conn.execute(statement,
+                                 tuple(_state_value(table, name, row, durations) for name in names))
             except sqlite3.IntegrityError as exc:
                 raise InvalidState(
                     f"state.{table} does not satisfy the constraints the schema declares") from exc
+
+
+def _state_value(table: str, name: str, row: dict, durations: dict[str, int]) -> object:
+    """The value to bind for one `state` cell, filling a stage-1 omission with its default.
+
+    A stage-1 export predates `combinable`, `table_ids` and `ends_at_utc`; §10 requires a new
+    service to accept it, so an absent (or `null`) optional column is filled here rather than
+    refused. `table_ids` is derived from `table_id`, and `ends_at_utc` from the reservation's own
+    restaurant duration and start, both inside the caller's transaction.
+    """
+    value = row.get(name)
+    if value is None and (table, name) in _STATE_OPTIONAL:
+        if (table, name) == ("reservations", "table_ids"):
+            table_id = row.get("table_id")
+            return json.dumps([table_id] if table_id else [])
+        if (table, name) == ("reservations", "ends_at_utc"):
+            starts = row.get("starts_at_utc")
+            restaurant = row.get("restaurant_id")
+            if starts and restaurant in durations:
+                return (dt.datetime.fromisoformat(starts)
+                        + dt.timedelta(minutes=durations[restaurant])).isoformat()
+            return None
+        return _STATE_OPTIONAL[(table, name)]
+    return value
 
 
 def _validated_state(state: object) -> None:
@@ -880,8 +991,8 @@ def _validated_state(state: object) -> None:
     """
     if not isinstance(state, dict):
         raise InvalidState("state must be a JSON object")
-    if state.get("schema") != STATE_SCHEMA:
-        raise InvalidState(f"state.schema must be {STATE_SCHEMA!r}")
+    if state.get("schema") not in _STATE_SCHEMAS:
+        raise InvalidState(f"state.schema must be one of {_STATE_SCHEMAS!r}")
 
     bad = _Violations()
     rows: dict[str, list[dict]] = {}
@@ -895,7 +1006,11 @@ def _validated_state(state: object) -> None:
             if not isinstance(row, dict):
                 raise InvalidState(f"{path} must be an object")
             for column, kind in spec:
+                if (table, column) in _STATE_OPTIONAL and column not in row:
+                    continue
                 value = row.get(column)
+                if value is None and (table, column) in _STATE_NULLABLE:
+                    continue
                 if kind is int:
                     # `bool` is an `int` in Python and binds as 1, so it has to be named out.
                     usable = isinstance(value, int) and not isinstance(value, bool)
@@ -983,9 +1098,51 @@ def ensure_schema() -> None:
         _widen_idempotency_for_path_scoping(conn)
         _add_table_fixture_ordinals(conn)
         _add_opening_hours_fixture_ordinals(conn)
+        _add_stage2_columns(conn)
         conn.executescript(SCHEMA_INDEXES)
     finally:
         conn.close()
+
+
+def _add_stage2_columns(conn: sqlite3.Connection) -> None:
+    """Add the columns stage 2 introduces and backfill them for an existing database.
+
+    A database written by stage 1 has no `combinable`, no `table_ids` and no `ends_at_utc`. A
+    single-table reservation's set is its one table, and its end is the restaurant's duration past
+    its start, so both are derivable and neither is guessed.
+    """
+    restaurant_columns = {row[1] for row in conn.execute("PRAGMA table_info(restaurants)")}
+    if "combinable" not in restaurant_columns:
+        conn.execute("ALTER TABLE restaurants ADD COLUMN combinable TEXT NOT NULL DEFAULT '[]'")
+
+    reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if "table_ids" not in reservation_columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN table_ids TEXT NOT NULL DEFAULT '[]'")
+    if "ends_at_utc" not in reservation_columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN ends_at_utc TEXT")
+
+    durations = {row[0]: row[1] for row in
+                 conn.execute("SELECT id, reservation_duration_minutes FROM restaurants")}
+    rows = conn.execute("SELECT reference, restaurant_id, table_id, table_ids,"
+                        " starts_at_utc, ends_at_utc FROM reservations").fetchall()
+    for row in rows:
+        table_ids = row["table_ids"]
+        ends_at_utc = row["ends_at_utc"]
+        set_parts: list[str] = []
+        values: list[object] = []
+        if not table_ids or table_ids == "[]":
+            set_parts.append("table_ids = ?")
+            values.append(json.dumps([row["table_id"]]))
+        if not ends_at_utc and row["starts_at_utc"]:
+            duration = durations.get(row["restaurant_id"])
+            if duration is not None:
+                set_parts.append("ends_at_utc = ?")
+                values.append((dt.datetime.fromisoformat(row["starts_at_utc"])
+                               + dt.timedelta(minutes=duration)).isoformat())
+        if set_parts:
+            values.append(row["reference"])
+            conn.execute(f"UPDATE reservations SET {', '.join(set_parts)} WHERE reference = ?",
+                         values)
 
 
 def _widen_tables_key_to_the_restaurant(conn: sqlite3.Connection) -> None:

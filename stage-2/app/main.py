@@ -298,7 +298,7 @@ def get_restaurant(request, match):
     try:
         row = conn.execute(
             "SELECT id, name, timezone, slot_minutes, reservation_duration_minutes,"
-            " cancellation_cutoff_minutes FROM restaurants WHERE id = ?",
+            " cancellation_cutoff_minutes, combinable FROM restaurants WHERE id = ?",
             (match.group("id"),),
         ).fetchone()
         if row is None:
@@ -324,12 +324,73 @@ def _restaurant_body(row, tables, hours):
         "slot_minutes": row["slot_minutes"],
         "reservation_duration_minutes": row["reservation_duration_minutes"],
         "cancellation_cutoff_minutes": row["cancellation_cutoff_minutes"],
+        "combinable": _combinable_pairs(row),
     }
     if tables is not None:
         body["tables"] = tables
     if hours is not None:
         body["opening_hours"] = hours
     return body
+
+
+def _json_list(value) -> list:
+    """A JSON array stored in a TEXT column, or `[]` if it is absent or unusable."""
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _reservation_table_ids(row) -> list[str]:
+    """The tables a reservation holds: its stored set, or its single `table_id`."""
+    parsed = _json_list(row["table_ids"] if "table_ids" in row.keys() else None)
+    if parsed:
+        return [str(member) for member in parsed]
+    return [row["table_id"]]
+
+
+def _combinable_pairs(restaurant) -> list[list[str]]:
+    """The restaurant's declared combinable pairs, each a two-member list, in fixture order."""
+    raw = restaurant["combinable"] if "combinable" in restaurant.keys() else None
+    pairs = []
+    for pair in _json_list(raw):
+        if isinstance(pair, list) and len(pair) == 2:
+            pairs.append([str(pair[0]), str(pair[1])])
+    return pairs
+
+
+def _table_taken(table_id, occupancy, starts, ends) -> bool:
+    return any(table_id in held and overlaps(starts, ends, other_start, other_end)
+               for held, other_start, other_end in occupancy)
+
+
+def _available_options(restaurant, tables, occupancy, starts, ends, party_size):
+    """Every single table then every declared pair that can seat the party at this slot (§ stage 2).
+
+    Singles first, in fixture order, then the combinable pairs in the order the restaurant declared
+    them. Membership and capacity are both required: a pair whose total seating is short of the
+    party, or one of whose members is already held across this interval, is not an option.
+    """
+    options = []
+    for table in tables:
+        if table["capacity"] >= party_size \
+                and not _table_taken(table["id"], occupancy, starts, ends):
+            options.append({"table_ids": [table["id"]], "capacity": table["capacity"]})
+    by_id = {table["id"]: table for table in tables}
+    for pair in _combinable_pairs(restaurant):
+        members = [by_id.get(table_id) for table_id in pair]
+        if any(member is None for member in members):
+            continue
+        capacity = sum(member["capacity"] for member in members)
+        if capacity < party_size:
+            continue
+        if any(_table_taken(table_id, occupancy, starts, ends) for table_id in pair):
+            continue
+        options.append({"table_ids": list(pair), "capacity": capacity})
+    return options
 
 
 def get_availability(request, match):
@@ -367,8 +428,8 @@ def get_availability(request, match):
             (restaurant["id"], WEEKDAYS[day.weekday()]),
         ).fetchall()
         booked = conn.execute(
-            "SELECT table_id, starts_at_utc FROM reservations WHERE restaurant_id = ?"
-            " AND status != 'cancelled'", (restaurant["id"],),
+            "SELECT table_id, table_ids, starts_at_utc, ends_at_utc FROM reservations"
+            " WHERE restaurant_id = ? AND status != 'cancelled'", (restaurant["id"],),
         ).fetchall()
     finally:
         conn.close()
@@ -381,7 +442,12 @@ def get_availability(request, match):
     zone = ZoneInfo(restaurant["timezone"])
     duration = restaurant["reservation_duration_minutes"]
     step = restaurant["slot_minutes"]
-    occupancy = [(row["table_id"], dt.datetime.fromisoformat(row["starts_at_utc"])) for row in booked]
+    occupancy = []
+    for row in booked:
+        other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
+        other_end = (dt.datetime.fromisoformat(row["ends_at_utc"]) if row["ends_at_utc"]
+                     else slot_end(other_start, duration))
+        occupancy.append((_reservation_table_ids(row), other_start, other_end))
 
     slots = []
     for cursor in _slot_starts(hours, step, duration):
@@ -399,9 +465,8 @@ def get_availability(request, match):
             if table["capacity"] < party_size:
                 continue
             taken = any(
-                table_id == table["id"] and overlaps(starts, ends, other_start, other_end)
-                for table_id, other_start in occupancy
-                for other_end in [slot_end(other_start, duration)]
+                table["id"] in other_tables and overlaps(starts, ends, other_start, other_end)
+                for other_tables, other_start, other_end in occupancy
             )
             if not taken:
                 free.append(table["id"])
@@ -412,6 +477,8 @@ def get_availability(request, match):
             "starts_at_local": f"{day.isoformat()}T{label}",
             "starts_at": format_instant(starts),
             "available_table_ids": free,
+            "available_options": _available_options(restaurant, tables, occupancy, starts, ends,
+                                                     party_size),
         })
 
     return 200, {"restaurant_id": restaurant["id"], "date": params["date"],
@@ -488,11 +555,18 @@ def post_reservation(request, match):
             conn.execute("COMMIT")
             return 200, replay
 
-        for field in ("restaurant_id", "table_id", "starts_at_local"):
+        for field in ("restaurant_id", "starts_at_local"):
             if field not in body:
                 raise _invalid(f"{field} is required")
             if not isinstance(body[field], str):
                 raise _malformed(f"{field} must be a string")
+        if "table_id" in body and not isinstance(body["table_id"], str):
+            raise _malformed("table_id must be a string")
+        if "table_ids" in body and (not isinstance(body["table_ids"], list)
+                                    or not all(isinstance(m, str) for m in body["table_ids"])):
+            raise _invalid("table_ids must be an array of table ids")
+        if "table_id" not in body and "table_ids" not in body:
+            raise _invalid("table_id is required")
         if "party_size" not in body:
             raise _invalid("party_size is required")
         if not isinstance(body["party_size"], int) or isinstance(body["party_size"], bool):
@@ -596,21 +670,65 @@ def _assert_within_opening_slot(conn, restaurant, starts):
                     f"{starts.strftime('%H:%M')} is outside this restaurant's opening hours")
 
 
-def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_size):
-    """Every check on a requested booking except occupancy. Returns `(table, starts)`.
+def _requested_table_ids(body):
+    """The table set a create/amend body asks for, from `table_ids` or the single `table_id`.
 
-    Split out from `_assert_slot_free` because §11:197 requires a batch's *non-occupancy* errors to
+    Exactly one of the two spellings is allowed, which is what §8 means by "a table set of one
+    member" once combinations exist: `table_id` is a set of one and `table_ids` names the set
+    directly. Carrying both is ambiguous rather than merely redundant, so it is a 422.
+    """
+    table_id = body.get("table_id")
+    table_ids = body.get("table_ids")
+    if table_ids is not None and table_id is not None:
+        raise _invalid("provide either table_id or table_ids, not both")
+    if table_ids is not None:
+        if not isinstance(table_ids, list) or not all(isinstance(m, str) for m in table_ids):
+            raise _invalid("table_ids must be an array of table ids")
+        return list(table_ids)
+    if table_id is not None:
+        return [table_id]
+    raise _invalid("table_id is required")
+
+
+def _resolve_table_set(conn, restaurant, table_ids):
+    """The table rows a requested set names, after the membership and combination rules.
+
+    Unknown table is 404, a repeat is 422 `validation_failed`, more than two is 422
+    `combination_not_allowed`, and two tables the restaurant does not declare combinable is 422
+    `combination_not_allowed`. Membership and the declared pair are both required; combining is not
+    transitive, so `[t_1, t_3]` is refused even when `[t_1, t_2]` and `[t_2, t_3]` are declared.
+    """
+    if not table_ids:
+        raise _invalid("at least one table is required")
+    if len(table_ids) > 2:
+        raise HttpError(422, "combination_not_allowed", "at most two tables may be combined")
+    if len(set(table_ids)) != len(table_ids):
+        raise _invalid("table_ids must be distinct")
+    tables = []
+    for table_id in table_ids:
+        row = conn.execute("SELECT * FROM tables WHERE id = ? AND restaurant_id = ?",
+                           (table_id, restaurant["id"])).fetchone()
+        if row is None:
+            raise HttpError(404, "not_found", "no such table at this restaurant")
+        tables.append(row)
+    if len(tables) == 2:
+        wanted = {table["id"] for table in tables}
+        if not any(set(pair) == wanted for pair in _combinable_pairs(restaurant)):
+            raise HttpError(422, "combination_not_allowed",
+                            "these two tables are not a declared combination")
+    return tables
+
+
+def _validate_booking_fields(conn, restaurant, tables, starts_at_local, party_size):
+    """Every check on a requested booking except occupancy. Returns `starts`.
+
+    Split out from `_assert_tables_free` because §11:197 requires a batch's *non-occupancy* errors to
     be settled before any occupancy error, which a single combined pass cannot express.
     """
-    table = conn.execute(
-        "SELECT * FROM tables WHERE id = ? AND restaurant_id = ?",
-        (table_id, restaurant["id"]),
-    ).fetchone()
-    if table is None:
-        raise HttpError(404, "not_found", "no such table at this restaurant")
     if party_size < 1:
         raise _invalid("party_size must be at least 1")
-    if table["capacity"] < party_size:
+    capacity = sum(table["capacity"] for table in tables)
+    if capacity < party_size:
         raise HttpError(422, "party_exceeds_capacity",
                         "party_size exceeds the table's capacity")
 
@@ -624,11 +742,11 @@ def _validate_booking_fields(conn, restaurant, table_id, starts_at_local, party_
     except NonExistentLocalTime as exc:
         raise HttpError(422, "invalid_local_time", str(exc)) from exc
     _assert_within_opening_slot(conn, restaurant, starts)
-    return table, starts
+    return starts
 
 
-def _assert_slot_free(conn, restaurant, table, starts, exclude_reference=None):
-    """409 `table_unavailable` if the requested interval collides with a live booking.
+def _assert_tables_free(conn, restaurant, tables, starts, exclude_reference=None):
+    """409 `table_unavailable` if any table in the set collides with a live booking.
 
     `exclude_reference` drops the reservation being amended from the check, which would otherwise
     collide with itself.
@@ -636,37 +754,39 @@ def _assert_slot_free(conn, restaurant, table, starts, exclude_reference=None):
     The query is scoped to `restaurant_id` because `table_id` is only unique *within* a restaurant.
     Keying `tables` by `(restaurant_id, id)` is what makes two restaurants able to own a `t_2`
     each, and this is the query that has to follow from that: without the scope, a booking at one
-    restaurant occupies an identically-numbered table at every other restaurant. The symptom is
-    worse than a lost booking, because it contradicts the read path -- `GET /availability` filters
-    by `restaurant_id`, so it *offers* `t_2`, and the booking then answers 409. An offered table
-    that cannot be booked is the defect, and only one of the two paths was scoped.
+    restaurant occupies an identically-numbered table at every other restaurant. A held set is
+    compared as a set, so a combination collides if *any* member is taken.
     """
     ends = slot_end(starts, restaurant["reservation_duration_minutes"])
-    clash = ("SELECT starts_at_utc FROM reservations"
-             " WHERE table_id = ? AND restaurant_id = ? AND status != 'cancelled'")
-    params = [table["id"], restaurant["id"]]
+    wanted = {table["id"] for table in tables}
+    clash = ("SELECT table_id, table_ids, starts_at_utc, ends_at_utc FROM reservations"
+             " WHERE restaurant_id = ? AND status != 'cancelled'")
+    params = [restaurant["id"]]
     if exclude_reference is not None:
         clash += " AND reference != ?"
         params.append(exclude_reference)
     for row in conn.execute(clash, params).fetchall():
+        if not (set(_reservation_table_ids(row)) & wanted):
+            continue
         other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
-        if overlaps(starts, ends, other_start,
-                    slot_end(other_start, restaurant["reservation_duration_minutes"])):
+        other_end = (dt.datetime.fromisoformat(row["ends_at_utc"]) if row["ends_at_utc"]
+                     else slot_end(other_start, restaurant["reservation_duration_minutes"]))
+        if overlaps(starts, ends, other_start, other_end):
             raise HttpError(409, "table_unavailable", "that table is already booked")
 
 
-def _resolve_booking(conn, restaurant, table_id, starts_at_local, party_size,
+def _resolve_booking(conn, restaurant, body, starts_at_local, party_size,
                      exclude_reference=None):
-    """Validate a booking exactly as create does and return `(table, starts)`.
+    """Validate a booking exactly as create does and return `(tables, starts)`.
 
     Shared with `PATCH /reservations/{reference}`, which the spec requires to apply "same
     validation as create" -- so it calls this rather than keeping a second copy that has to be
     kept in agreement.
     """
-    table, starts = _validate_booking_fields(conn, restaurant, table_id,
-                                             starts_at_local, party_size)
-    _assert_slot_free(conn, restaurant, table, starts, exclude_reference)
-    return table, starts
+    tables = _resolve_table_set(conn, restaurant, _requested_table_ids(body))
+    starts = _validate_booking_fields(conn, restaurant, tables, starts_at_local, party_size)
+    _assert_tables_free(conn, restaurant, tables, starts, exclude_reference)
+    return tables, starts
 
 
 def _create_reservation(conn, body, user_id):
@@ -680,18 +800,20 @@ def _create_reservation(conn, body, user_id):
     if restaurant is None:
         raise HttpError(404, "not_found", "no such restaurant")
     party_size = body["party_size"]
-    table, starts = _resolve_booking(conn, restaurant, body["table_id"],
-                                      body["starts_at_local"], party_size)
+    tables, starts = _resolve_booking(conn, restaurant, body, body["starts_at_local"], party_size)
 
     reference = _new_reference()
     created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    table_ids = [table["id"] for table in tables]
+    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
     conn.execute(
-        "INSERT INTO reservations (reference, restaurant_id, table_id, user_id,"
-        " starts_at_utc, starts_at_local, party_size, status, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)",
-        (reference, restaurant["id"], table["id"], user_id,
+        "INSERT INTO reservations (reference, restaurant_id, table_id, table_ids, user_id,"
+        " starts_at_utc, starts_at_local, ends_at_utc, party_size, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)",
+        (reference, restaurant["id"], table_ids[0], json.dumps(table_ids), user_id,
          starts.astimezone(dt.timezone.utc).isoformat(),
-         body["starts_at_local"], party_size, created_at),
+         body["starts_at_local"], ends.astimezone(dt.timezone.utc).isoformat(),
+         party_size, created_at),
     )
     stored = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                           (reference,)).fetchone()
@@ -719,9 +841,15 @@ def patch_reservation(request, match):
     body = request.json_body()
     if not isinstance(body, dict):
         raise _malformed("request body must be a JSON object")
-    for field in ("table_id", "starts_at_local"):
-        if field in body and not isinstance(body[field], str):
-            raise _malformed(f"{field} must be a string")
+    if "table_id" in body and not isinstance(body["table_id"], str):
+        raise _malformed("table_id must be a string")
+    if "table_ids" in body and (not isinstance(body["table_ids"], list)
+                                or not all(isinstance(m, str) for m in body["table_ids"])):
+        raise _invalid("table_ids must be an array of table ids")
+    if "table_id" in body and "table_ids" in body:
+        raise _invalid("provide either table_id or table_ids, not both")
+    if "starts_at_local" in body and not isinstance(body["starts_at_local"], str):
+        raise _malformed("starts_at_local must be a string")
     if "party_size" in body and (not isinstance(body["party_size"], int)
                                  or isinstance(body["party_size"], bool)):
         # §5:172-174: `party_size` strings and booleans are 422 validation_failed; the other two
@@ -748,21 +876,31 @@ def patch_reservation(request, match):
                                   (row["restaurant_id"],)).fetchone()
         _enforce_cutoff(row, restaurant, "amend")
 
-        # Absent fields keep their stored value, which is what makes the subset literal.
-        table_id = body.get("table_id", row["table_id"])
+        # Absent fields keep their stored value, which is what makes the subset literal. A missing
+        # table field keeps the reservation's current set, which may be a combination.
+        if "table_ids" in body:
+            requested = list(body["table_ids"])
+        elif "table_id" in body:
+            requested = [body["table_id"]]
+        else:
+            requested = _reservation_table_ids(row)
         starts_at_local = body.get("starts_at_local", row["starts_at_local"])
         party_size = body.get("party_size", row["party_size"])
 
-        _table, starts = _resolve_booking(conn, restaurant, table_id, starts_at_local,
-                                          party_size, exclude_reference=reference)
+        tables, starts = _resolve_booking(conn, restaurant, {"table_ids": requested},
+                                          starts_at_local, party_size,
+                                          exclude_reference=reference)
+        table_ids = [table["id"] for table in tables]
+        ends = slot_end(starts, restaurant["reservation_duration_minutes"])
 
         # `reference` and `status` are deliberately absent from the SET list: the spec requires both
         # to survive an amendment.
         conn.execute(
-            "UPDATE reservations SET table_id = ?, starts_at_local = ?, starts_at_utc = ?,"
-            " party_size = ? WHERE reference = ?",
-            (table_id, starts_at_local, starts.astimezone(dt.timezone.utc).isoformat(),
-             party_size, reference),
+            "UPDATE reservations SET table_id = ?, table_ids = ?, starts_at_local = ?,"
+            " starts_at_utc = ?, ends_at_utc = ?, party_size = ? WHERE reference = ?",
+            (table_ids[0], json.dumps(table_ids), starts_at_local,
+             starts.astimezone(dt.timezone.utc).isoformat(),
+             ends.astimezone(dt.timezone.utc).isoformat(), party_size, reference),
         )
         updated = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                (reference,)).fetchone()
@@ -922,31 +1060,31 @@ def post_reservation_moves(request, match):
             _enforce_cutoff(row, restaurant, "amend")
 
             # Absent fields keep their stored value, exactly as an amendment's subset does (:192).
-            table_id = item.get("table_id", row["table_id"])
             starts_at_local = item.get("starts_at_local", row["starts_at_local"])
             party_size = item.get("party_size", row["party_size"])
-
-            # The item's own wrong-JSON-type rules, here rather than in `_validated_moves`, because
-            # :197 makes the *batch's* earliest non-occupancy error the answer. `table_id` and
-            # `starts_at_local` answer 400 `malformed_request` -- §5:48's generic rule, and the code
-            # `patch_reservation` already gives the same two fields. `party_size` answers 422
-            # because §5:57 says so in as many words; that row contradicts §5:48 and the
-            # contradiction is an open named defect (`party_size_wrong_type_is_422`) that this
-            # endpoint inherits rather than settles.
-            #
-            # Position matters as much as the code. Above the cutoff is §11:198's "cutoff errors
-            # preceding other changes for that booking"; below it, because a booking already inside
-            # its window cannot be amended whatever the amendment says.
-            if not isinstance(table_id, str):
+            if "table_id" in item and not isinstance(item["table_id"], str):
                 raise _malformed("table_id must be a string")
+            if "table_ids" in item and (not isinstance(item["table_ids"], list)
+                                        or not all(isinstance(m, str)
+                                                   for m in item["table_ids"])):
+                raise _invalid("table_ids must be an array of table ids")
+            if "table_id" in item and "table_ids" in item:
+                raise _invalid("provide either table_id or table_ids, not both")
             if not isinstance(starts_at_local, str):
                 raise _malformed("starts_at_local must be a string")
             if not isinstance(party_size, int) or isinstance(party_size, bool):
                 raise _invalid("party_size must be an integer")
 
-            table, starts = _validate_booking_fields(conn, restaurant, table_id,
-                                                     starts_at_local, party_size)
-            planned.append((reference, table, starts, table_id, starts_at_local, party_size))
+            if "table_ids" in item:
+                requested = list(item["table_ids"])
+            elif "table_id" in item:
+                requested = [item["table_id"]]
+            else:
+                requested = _reservation_table_ids(row)
+            tables = _resolve_table_set(conn, restaurant, requested)
+            starts = _validate_booking_fields(conn, restaurant, tables,
+                                              starts_at_local, party_size)
+            planned.append((reference, tables, starts, starts_at_local, party_size))
 
         # Pass two: occupancy against the batch's *resulting* state, not the pre-batch one.
         # Checking each item against the live table would refuse a conflict-free swap: the first
@@ -957,37 +1095,44 @@ def post_reservation_moves(request, match):
         # who tries to take its slot) -- and against every booking that is not moving (:199 "or
         # with an unlisted booking"). The checks run in input order, so :197's ordering is
         # preserved for occupancy conflicts as well as non-occupancy errors.
-        listed = [reference for reference, _table, _starts, _table_id, _starts_at_local,
-                  _party_size in planned]
+        listed = [reference for reference, _tables, _starts, _s, _p in planned]
         in_clause = ", ".join("?" for _ in listed)
         compiled = []
         results = []
-        for reference, table, starts, table_id, starts_at_local, party_size in planned:
+        for reference, tables, starts, starts_at_local, party_size in planned:
             ends = slot_end(starts, restaurant["reservation_duration_minutes"])
-            for other_table, other_starts, other_ends in compiled:
-                if other_table["id"] == table["id"] and overlaps(
-                        starts, ends, other_starts, other_ends):
+            wanted = {table["id"] for table in tables}
+            for other_tables, other_starts, other_ends in compiled:
+                if wanted & {table["id"] for table in other_tables} \
+                        and overlaps(starts, ends, other_starts, other_ends):
                     raise HttpError(409, "table_unavailable", "that table is already booked")
-            clash = ("SELECT starts_at_utc FROM reservations"
-                     " WHERE table_id = ? AND restaurant_id = ? AND status != 'cancelled'"
+            clash = ("SELECT table_id, table_ids, starts_at_utc, ends_at_utc FROM reservations"
+                     " WHERE restaurant_id = ? AND status != 'cancelled'"
                      f" AND reference NOT IN ({in_clause})")
-            for row in conn.execute(clash, (table["id"], restaurant["id"], *listed)).fetchall():
+            for row in conn.execute(clash, (restaurant["id"], *listed)).fetchall():
+                if not (set(_reservation_table_ids(row)) & wanted):
+                    continue
                 other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
-                if overlaps(starts, ends, other_start,
-                            slot_end(other_start, restaurant["reservation_duration_minutes"])):
+                other_end = (dt.datetime.fromisoformat(row["ends_at_utc"])
+                             if row["ends_at_utc"]
+                             else slot_end(other_start,
+                                           restaurant["reservation_duration_minutes"]))
+                if overlaps(starts, ends, other_start, other_end):
                     raise HttpError(409, "table_unavailable", "that table is already booked")
+            table_ids = [table["id"] for table in tables]
             # `reference`, `status`, `user_id` and `created_at` are deliberately absent from the SET
             # list: §11:194 keeps identity, owner and creation time unchanged through a move.
             conn.execute(
-                "UPDATE reservations SET table_id = ?, starts_at_local = ?, starts_at_utc = ?,"
-                " party_size = ? WHERE reference = ?",
-                (table_id, starts_at_local,
-                 starts.astimezone(dt.timezone.utc).isoformat(), party_size, reference),
+                "UPDATE reservations SET table_id = ?, table_ids = ?, starts_at_local = ?,"
+                " starts_at_utc = ?, ends_at_utc = ?, party_size = ? WHERE reference = ?",
+                (table_ids[0], json.dumps(table_ids), starts_at_local,
+                 starts.astimezone(dt.timezone.utc).isoformat(),
+                 ends.astimezone(dt.timezone.utc).isoformat(), party_size, reference),
             )
             moved = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                  (reference,)).fetchone()
             results.append(_reservation_body(moved, restaurant))
-            compiled.append((table, starts, ends))
+            compiled.append((tables, starts, ends))
 
         created = (201, {"reservations": results})
         conn.execute(
@@ -1068,13 +1213,17 @@ def _reservation_body(row, restaurant=None):
             conn.close()
     starts = dt.datetime.fromisoformat(row["starts_at_utc"])
     zone = ZoneInfo(restaurant["timezone"])
-    ends = slot_end(starts, restaurant["reservation_duration_minutes"]).astimezone(zone)
+    if row["ends_at_utc"]:
+        ends = dt.datetime.fromisoformat(row["ends_at_utc"]).astimezone(zone)
+    else:
+        ends = slot_end(starts, restaurant["reservation_duration_minutes"]).astimezone(zone)
     created = dt.datetime.fromisoformat(row["created_at"])
-    return {
+    table_ids = _reservation_table_ids(row)
+    body = {
         "reference": row["reference"],
         "reservation_id": row["reference"],
         "restaurant_id": row["restaurant_id"],
-        "table_id": row["table_id"],
+        "table_ids": table_ids,
         "user_id": row["user_id"],
         "starts_at_local": row["starts_at_local"],
         # §8's worked examples render both starts_at and ends_at in the restaurant's zone -- a
@@ -1088,9 +1237,433 @@ def _reservation_body(row, restaurant=None):
         "status": row["status"],
         "created_at": format_instant(created),
     }
+    # §8: "When the set has one member the response still carries `table_id`"; a two-member set
+    # omits it, because `table_ids` is then the whole statement of what was booked.
+    if len(table_ids) == 1:
+        body["table_id"] = table_ids[0]
+    return body
+
+
+class Html:
+    """A handler result that is rendered as HTML rather than the JSON envelope."""
+
+    def __init__(self, body: bytes, content_type: str = "text/html; charset=utf-8"):
+        self.body = body
+        self.content_type = content_type
+
+
+def ui(request, match):
+    """Serve the single-page UI. All four browser routes share one document (§9)."""
+    return 200, Html(_UI_HTML.encode("utf-8"))
+
+
+_UI_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tablekeeper</title>
+<style>
+ body{font-family:system-ui,Arial,sans-serif;margin:0;color:#1c1c1c}
+ header{border-bottom:1px solid #ddd;padding:.5rem 1rem}
+ header nav a{margin-right:.75rem}
+ main{padding:1rem;max-width:760px}
+ label{display:block;margin:.5rem 0}
+ input,select,button{font:inherit;padding:.35rem}
+ .slot{display:flex;align-items:center;gap:.4rem;margin:.2rem 0}
+ .cell{padding:.2rem .5rem;border:1px solid #999;background:#eaf7ea}
+ .cell[data-available='false']{background:#f2f2f2;color:#999}
+ .combo{background:#e6eefc}
+ [data-testid='availability-grid']{margin-top:1rem}
+ [data-testid='booking-form'],[data-testid='confirmation']{margin-top:1rem;border-top:1px dashed #ccc;padding-top:.5rem}
+ [data-testid='auth-error'],[data-testid='booking-error'],[data-testid='reservation-error']{color:#b00020;margin:.5rem 0}
+ [data-testid='booking-uncertain']{color:#8a6d00;margin:.5rem 0}
+</style>
+</head>
+<body>
+<header id="header"></header>
+<main id="app"></main>
+<script>
+const $ = function(id){ return document.querySelector("[data-testid='" + id + "']"); };
+function esc(v){
+  return String(v == null ? '' : v).replace(/[&<>"']/g, function(c){
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+  });
+}
+let token = localStorage.getItem('tk_token');
+let currentUser = null;
+try { currentUser = JSON.parse(localStorage.getItem('tk_user') || 'null'); } catch (e) { currentUser = null; }
+let booking = null;
+let searchSeq = 0;
+let lastSearch = null;
+
+function setSession(t, u){
+  token = t; currentUser = u;
+  if (t) { localStorage.setItem('tk_token', t); } else { localStorage.removeItem('tk_token'); }
+  if (u) { localStorage.setItem('tk_user', JSON.stringify(u)); } else { localStorage.removeItem('tk_user'); }
+  renderHeader();
+}
+async function api(method, path, body, extra){
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) { headers['Authorization'] = 'Bearer ' + token; }
+  if (extra) { for (const k in extra) { headers[k] = extra[k]; } }
+  const opts = { method: method, headers: headers };
+  if (body !== undefined) { opts.body = JSON.stringify(body); }
+  const res = await fetch(path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  return { ok: res.ok, status: res.status, data: data };
+}
+function messageOf(data){
+  if (data && data.error && data.error.message) { return data.error.message; }
+  return 'Request failed';
+}
+function newKey(){
+  if (window.crypto && crypto.randomUUID) { return crypto.randomUUID(); }
+  return 'k' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+function labelOf(tables, id){
+  for (let i = 0; i < tables.length; i++) { if (tables[i].id === id) { return tables[i].label; } }
+  return id;
+}
+function defaultDate(){
+  const d = new Date();
+  d.setDate(d.getDate() + 7);
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return d.getFullYear() + '-' + m + '-' + day;
+}
+
+function renderHeader(){
+  const h = document.getElementById('header');
+  let html = '<nav><a href="/">Search</a> <a href="/lookup">Lookup</a>';
+  if (currentUser) {
+    html += ' <span data-testid="current-user">' + esc(currentUser.display_name) + '</span>';
+    html += ' <button data-testid="logout-button">Log out</button>';
+  } else {
+    html += ' <a href="/login">Log in</a> <a href="/signup">Sign up</a>';
+  }
+  html += '</nav>';
+  h.innerHTML = html;
+  const out = $('logout-button');
+  if (out) { out.onclick = function(){ setSession(null, null); route(); }; }
+}
+
+function route(){
+  renderHeader();
+  const path = location.pathname;
+  if (path === '/signup') { return renderSignup(); }
+  if (path === '/login') { return renderLogin(); }
+  if (path === '/lookup') { return renderLookup(); }
+  return renderSearch();
+}
+
+function showAuthError(message){
+  let el = $('auth-error');
+  if (!el) {
+    el = document.createElement('div');
+    el.setAttribute('data-testid', 'auth-error');
+    const host = document.getElementById('auth-error-slot') || document.getElementById('app');
+    host.appendChild(el);
+  }
+  el.textContent = message;
+}
+function clearAuthError(){
+  const el = $('auth-error');
+  if (el) { el.remove(); }
+}
+
+function renderLogin(){
+  document.getElementById('app').innerHTML =
+    '<h1>Log in</h1>' +
+    '<form id="login-form">' +
+    '<label>Email <input type="email" data-testid="login-email"></label>' +
+    '<label>Password <input type="password" data-testid="login-password"></label>' +
+    '<button type="submit" data-testid="login-submit">Log in</button>' +
+    '</form>' +
+    '<div id="auth-error-slot"></div>';
+  document.getElementById('login-form').onsubmit = async function(e){
+    e.preventDefault();
+    clearAuthError();
+    const r = await api('POST', '/auth/login',
+      { email: $('login-email').value, password: $('login-password').value });
+    if (r.ok && r.data && r.data.token) { setSession(r.data.token, r.data); route(); }
+    else { showAuthError(messageOf(r.data)); }
+  };
+}
+
+function renderSignup(){
+  document.getElementById('app').innerHTML =
+    '<h1>Sign up</h1>' +
+    '<form id="signup-form">' +
+    '<label>Email <input type="email" data-testid="signup-email"></label>' +
+    '<label>Password <input type="password" data-testid="signup-password"></label>' +
+    '<label>Display name <input data-testid="signup-display-name"></label>' +
+    '<button type="submit" data-testid="signup-submit">Sign up</button>' +
+    '</form>' +
+    '<div id="auth-error-slot"></div>';
+  document.getElementById('signup-form').onsubmit = async function(e){
+    e.preventDefault();
+    clearAuthError();
+    const r = await api('POST', '/auth/signup', {
+      email: $('signup-email').value,
+      password: $('signup-password').value,
+      display_name: $('signup-display-name').value
+    });
+    if (r.ok && r.data && r.data.token) { setSession(r.data.token, r.data); route(); }
+    else { showAuthError(messageOf(r.data)); }
+  };
+}
+
+function renderSearch(){
+  document.getElementById('app').innerHTML =
+    '<h1>Find a table</h1>' +
+    '<div class="search">' +
+    '<label>Restaurant <select data-testid="restaurant-select"></select></label>' +
+    '<label>Date <input type="date" data-testid="date-input"></label>' +
+    '<label>Party size <input type="number" min="1" value="2" data-testid="party-size-input"></label>' +
+    '<button data-testid="search-button">Search</button>' +
+    '</div>' +
+    '<div id="auth-error-slot"></div>' +
+    '<div id="grid-area"></div>' +
+    '<div data-testid="booking-area"></div>';
+  $('date-input').value = defaultDate();
+  loadRestaurants();
+  $('search-button').onclick = doSearch;
+}
+async function loadRestaurants(){
+  const r = await api('GET', '/restaurants');
+  const select = $('restaurant-select');
+  if (!select || !r.data) { return; }
+  select.innerHTML = '';
+  (r.data.restaurants || []).forEach(function(x){
+    const option = document.createElement('option');
+    option.value = x.id;
+    option.textContent = x.name;
+    select.appendChild(option);
+  });
+}
+function renderNoSlots(){
+  const area = document.getElementById('grid-area');
+  if (area) { area.innerHTML = '<div data-testid="no-slots">No tables available</div>'; }
+}
+async function doSearch(){
+  const seq = ++searchSeq;
+  const area = $('booking-area');
+  if (area) { area.innerHTML = ''; }
+  const rid = $('restaurant-select').value;
+  const date = $('date-input').value;
+  const party = parseInt($('party-size-input').value, 10);
+  const detail = await api('GET', '/restaurants/' + encodeURIComponent(rid));
+  const avail = await api('GET', '/availability?restaurant_id=' + encodeURIComponent(rid) +
+    '&date=' + encodeURIComponent(date) + '&party_size=' + encodeURIComponent(party));
+  if (seq !== searchSeq) { return; }
+  if (!detail.ok || !avail.ok) { renderNoSlots(); return; }
+  lastSearch = { detail: detail.data, rid: rid, date: date, party: party };
+  renderGrid(detail.data, avail.data, party);
+}
+async function refreshGrid(){
+  if (!lastSearch) { return; }
+  const avail = await api('GET', '/availability?restaurant_id=' + encodeURIComponent(lastSearch.rid) +
+    '&date=' + encodeURIComponent(lastSearch.date) + '&party_size=' + encodeURIComponent(lastSearch.party));
+  if (avail.ok && avail.data) { renderGrid(lastSearch.detail, avail.data, lastSearch.party); }
+}
+function renderGrid(detail, avail, party){
+  const area = document.getElementById('grid-area');
+  const slots = avail.slots || [];
+  if (slots.length === 0) { renderNoSlots(); return; }
+  const tables = detail.tables || [];
+  const grid = document.createElement('div');
+  grid.setAttribute('data-testid', 'availability-grid');
+  slots.forEach(function(slot){
+    const time = slot.starts_at_local.split('T')[1];
+    const row = document.createElement('div');
+    row.className = 'slot';
+    const label = document.createElement('span');
+    label.textContent = time;
+    row.appendChild(label);
+    const available = {};
+    (slot.available_table_ids || []).forEach(function(id){ available[id] = true; });
+    tables.forEach(function(t){
+      const cell = document.createElement('button');
+      cell.setAttribute('data-testid', 'slot-' + t.id + '-' + time);
+      cell.setAttribute('data-available', available[t.id] ? 'true' : 'false');
+      cell.className = 'cell';
+      cell.textContent = t.label;
+      cell.onclick = function(){
+        if (cell.getAttribute('data-available') !== 'true') { return; }
+        openBooking(detail, [t.id], time, slot.starts_at_local, party);
+      };
+      row.appendChild(cell);
+    });
+    (slot.available_options || []).forEach(function(opt){
+      if (!opt.table_ids || opt.table_ids.length < 2) { return; }
+      const ids = opt.table_ids;
+      const cell = document.createElement('button');
+      cell.setAttribute('data-testid', 'slot-' + ids.join('+') + '-' + time);
+      cell.setAttribute('data-available', 'true');
+      cell.className = 'cell combo';
+      cell.textContent = ids.map(function(id){ return labelOf(tables, id); }).join('+');
+      cell.onclick = function(){ openBooking(detail, ids, time, slot.starts_at_local, party); };
+      row.appendChild(cell);
+    });
+    grid.appendChild(row);
+  });
+  area.innerHTML = '';
+  area.appendChild(grid);
+}
+function openBooking(detail, tableIds, time, startsLocal, party){
+  clearAuthError();
+  if (!token) { showAuthError('Sign in to book a table'); return; }
+  booking = { detail: detail, tableIds: tableIds, startsLocal: startsLocal, party: party, key: newKey(), busy: false };
+  const area = $('booking-area');
+  area.innerHTML = '';
+  const form = document.createElement('div');
+  form.setAttribute('data-testid', 'booking-form');
+  const labels = tableIds.map(function(id){ return labelOf(detail.tables, id); }).join(', ');
+  form.innerHTML =
+    '<div data-testid="booking-summary">' + esc(detail.name) + ' — Table ' + esc(labels) +
+    ' at ' + esc(time) + '</div>' +
+    '<label>Party size <input type="number" min="1" data-testid="booking-party-size" value="' + party + '"></label>' +
+    '<button data-testid="booking-submit">Book</button>';
+  area.appendChild(form);
+  const size = $('booking-party-size');
+  size.oninput = function(){
+    booking.party = parseInt(size.value, 10) || 0;
+    booking.key = newKey();
+    clearBookingError();
+    clearUncertain();
+  };
+  $('booking-submit').onclick = submitBooking;
+}
+function formEl(testid){
+  const form = $('booking-form');
+  if (!form) { return null; }
+  let el = form.querySelector("[data-testid='" + testid + "']");
+  if (!el) {
+    el = document.createElement('div');
+    el.setAttribute('data-testid', testid);
+    form.appendChild(el);
+  }
+  return el;
+}
+function setBookingError(message){ const el = formEl('booking-error'); if (el) { el.textContent = message; } }
+function clearBookingError(){ const form = $('booking-form'); if (form) { const e = form.querySelector("[data-testid='booking-error']"); if (e) { e.remove(); } } }
+function setUncertain(message){ const el = formEl('booking-uncertain'); if (el) { el.textContent = message; } }
+function clearUncertain(){ const form = $('booking-form'); if (form) { const e = form.querySelector("[data-testid='booking-uncertain']"); if (e) { e.remove(); } } }
+async function submitBooking(){
+  if (!booking || booking.busy) { return; }
+  const body = {
+    restaurant_id: booking.detail.id,
+    table_ids: booking.tableIds,
+    starts_at_local: booking.startsLocal,
+    party_size: booking.party
+  };
+  booking.busy = true;
+  let r = null;
+  try {
+    r = await api('POST', '/reservations', body, { 'Idempotency-Key': booking.key });
+  } catch (e) {
+    booking.busy = false;
+    setUncertain('We could not confirm that booking. Press Book to try again.');
+    return;
+  }
+  booking.busy = false;
+  if (r.ok && r.data) {
+    clearBookingError();
+    clearUncertain();
+    renderConfirmation(r.data);
+  } else {
+    setBookingError(messageOf(r.data));
+    if (r.status === 409) { await refreshGrid(); }
+  }
+}
+function renderConfirmation(data){
+  const area = $('booking-area');
+  if (!area) { return; }
+  let el = area.querySelector("[data-testid='confirmation']");
+  if (!el) {
+    el = document.createElement('div');
+    el.setAttribute('data-testid', 'confirmation');
+    area.appendChild(el);
+  }
+  const ids = data.table_ids || booking.tableIds;
+  const labels = ids.map(function(id){ return labelOf(booking.detail.tables, id); }).join(', ');
+  const time = (data.starts_at_local || booking.startsLocal).split('T')[1];
+  el.innerHTML =
+    '<div data-testid="confirmation-reference">' + esc(data.reference) + '</div>' +
+    '<div data-testid="confirmation-details">' + esc(booking.detail.name) + ' — Table ' +
+    esc(labels) + ' at ' + esc(time) + '</div>' +
+    '<div data-testid="confirmation-tables">' + esc(labels) + '</div>';
+}
+
+function renderLookup(){
+  document.getElementById('app').innerHTML =
+    '<h1>Look up a booking</h1>' +
+    '<form id="lookup-form">' +
+    '<label>Reference <input data-testid="lookup-reference-input"></label>' +
+    '<button type="submit" data-testid="lookup-submit">Look up</button>' +
+    '</form>' +
+    '<div data-testid="lookup-result"></div>';
+  document.getElementById('lookup-form').onsubmit = async function(e){
+    e.preventDefault();
+    await doLookup();
+  };
+}
+async function doLookup(){
+  const reference = $('lookup-reference-input').value.trim();
+  const r = await api('GET', '/reservations/' + encodeURIComponent(reference));
+  const out = $('lookup-result');
+  if (r.ok && r.data) { renderReservation(out, r.data); }
+  else { out.innerHTML = '<div data-testid="reservation-error">' + esc(messageOf(r.data)) + '</div>'; }
+}
+async function renderReservation(out, data){
+  const ids = data.table_ids || (data.table_id ? [data.table_id] : []);
+  let labels = ids.join(', ');
+  try {
+    const detail = await api('GET', '/restaurants/' + encodeURIComponent(data.restaurant_id));
+    if (detail.ok && detail.data) {
+      labels = ids.map(function(id){ return labelOf(detail.data.tables || [], id); }).join(', ');
+    }
+  } catch (e) { /* keep the technical ids as a fallback */ }
+  let html = '<div data-testid="reservation-detail">' +
+    '<div data-testid="reservation-status">' + esc(data.status) + '</div>' +
+    '<div data-testid="reservation-tables">' + esc(labels) + '</div>';
+  if (data.status === 'confirmed') {
+    html += '<button data-testid="reservation-cancel-button">Cancel</button>';
+  }
+  html += '</div>';
+  out.innerHTML = html;
+  const button = $('reservation-cancel-button');
+  if (button) {
+    button.onclick = async function(){
+      const r = await api('POST', '/reservations/' + encodeURIComponent(data.reference) + '/cancel');
+      if (r.ok && r.data) { renderReservation(out, r.data); }
+      else {
+        let err = out.querySelector("[data-testid='reservation-error']");
+        if (!err) {
+          err = document.createElement('div');
+          err.setAttribute('data-testid', 'reservation-error');
+          out.appendChild(err);
+        }
+        err.textContent = messageOf(r.data);
+      }
+    };
+  }
+}
+
+route();
+</script>
+</body>
+</html>
+"""
 
 
 ROUTES = [
+    ("GET", re.compile(r"^/$"), ui),
+    ("GET", re.compile(r"^/signup$"), ui),
+    ("GET", re.compile(r"^/login$"), ui),
+    ("GET", re.compile(r"^/lookup$"), ui),
     ("GET", re.compile(r"^/health$"), health),
     ("POST", re.compile(r"^/_test/reset$"), reset),
     ("GET", re.compile(r"^/_test/export$"), export_snapshot),
@@ -1191,13 +1764,18 @@ class Handler(BaseHTTPRequestHandler):
                                           "correlation_id": correlation}})
 
     def _respond(self, status: int, body) -> None:
-        if status == 204 or body is None:
+        if isinstance(body, Html):
+            payload = body.body
+            content_type = body.content_type
+        elif status == 204 or body is None:
             payload = b""
+            content_type = JSON_CONTENT_TYPE
         else:
             payload = json.dumps(body).encode("utf-8")
+            content_type = JSON_CONTENT_TYPE
         self.send_response(status)
         if payload:
-            self.send_header("Content-Type", JSON_CONTENT_TYPE)
+            self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         if payload:
