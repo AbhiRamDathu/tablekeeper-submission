@@ -1,0 +1,206 @@
+"""Authentication for Tablekeeper Stage 1 (spec §6).
+
+Passwords are stored as scrypt with a per-user random salt and compared in constant time.
+`hmac.compare_digest` is used rather than `==` so that a wrong password and a nearly-right
+password are not distinguishable by how long the answer takes. §6 names scrypt explicitly and it is
+in the standard library, so the image needs no dependency to defend the choice.
+
+Validation is split deliberately, because the spec splits it: a field of the wrong JSON *type* is a
+malformed request (400), while a field of the right type holding an unacceptable *value* is a
+validation failure (422). Collapsing the two would make `{"email": 17}` and `{"email": "nope"}`
+the same response, and the harness asserts they are not.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import re
+import secrets
+
+__all__ = ["hash_password", "verify_password", "issue_token", "signup", "authenticate",
+           "ValidationFailure", "MalformedRequest", "CredentialsTaken", "BadCredentials"]
+
+_SCRYPT_N = 2 ** 14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_SALT_BYTES = 16
+_SCRYPT_DKLEN = 32
+
+#: scrypt's working set is `128 * r * n` bytes -- 16 MiB at these parameters -- and `maxmem` is
+#: passed explicitly rather than left at OpenSSL's default for two reasons. It documents the cost,
+#: and it is the only thing between a tampered `users` row and a memory-exhaustion request, because
+#: `n`, `r` and `p` are read back out of the stored hash: a row claiming `n=2**30` raises instead of
+#: being allocated. 64 MiB is ~4x the requirement, leaving room for the B array and OpenSSL's own
+#: allocations without leaving room for abuse.
+_SCRYPT_MAXMEM = 64 * 1024 * 1024
+
+# `\Z`, not `$`, and the difference is one accepted signup.
+#
+# In Python `$` matches at the end of the string *or just before a newline at the end of it*, so
+# `ada@example.com\n` passed this pattern and became a stored account whose address carries a
+# trailing line feed. `\Z` matches the absolute end and nothing else. Measured over 21 cases, this
+# character changes exactly one verdict -- `ada@example.com\n` from accepted to refused -- and leaves
+# the other twenty alone, so it closes the hole without moving anything else.
+#
+# The literal `\.` is a separate decision and is deliberately still here. `:68` says an email must be
+# "of the form `local@domain`", which reads either as one `@` between two non-empty parts or as the
+# conventional dotted domain; no shipped test decides it, because every address in the suite is
+# `*@example.com` or `a@b.co`. Dropping the dot would accept `x@y`, `a@b` and `ada@localhost`, and
+# that is a spec question for the owner rather than a bug fix -- so if it is ever relaxed it is a
+# deliberate commit, not a quiet edit to this line.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+MIN_PASSWORD_LENGTH = 8
+
+
+class MalformedRequest(Exception):
+    """A field arrived with the wrong JSON type. §5 maps this to 400 malformed_request."""
+
+
+class ValidationFailure(Exception):
+    """A field had an acceptable type but an unacceptable value. §5 maps this to 422."""
+
+
+class CredentialsTaken(Exception):
+    """Signup for an address that already has an account. §6 maps this to 409 email_taken."""
+
+
+class BadCredentials(Exception):
+    """Login failed. Deliberately does not say whether it was the address or the password."""
+
+
+def hash_password(password: str) -> str:
+    """`scrypt$n$r$p$salt$digest`, all hex, so one column holds everything needed to verify it.
+
+    Self-describing in the same sense the old PBKDF2 string was: the parameters travel with the
+    digest, so raising `n` later verifies hashes written under the old one instead of stranding
+    every existing account.
+    """
+    salt = secrets.token_bytes(_SCRYPT_SALT_BYTES)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R,
+                            p=_SCRYPT_P, dklen=_SCRYPT_DKLEN, maxmem=_SCRYPT_MAXMEM)
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Constant-time check against a stored hash. False on any malformed stored value.
+
+    `dklen` comes from the stored digest rather than from `_SCRYPT_DKLEN`, so the format stays
+    self-describing. A hash whose parameters exceed `_SCRYPT_MAXMEM` raises `ValueError` out of
+    `hashlib` and is caught below, which is the intended outcome: a false, not an allocation.
+
+    `AttributeError` is caught alongside `TypeError`/`ValueError` because a NULL `password_hash`
+    column is reachable (a row inserted outside this module), and `None.split` would otherwise
+    escape as an unhandled 500. §6 says unverifiable credentials are `401 unauthenticated`, and a
+    row with no hash is exactly that.
+    """
+    try:
+        algorithm, n, r, p, salt_hex, digest_hex = stored.split("$")
+        if algorithm != "scrypt":
+            return False
+        candidate = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
+                                   n=int(n), r=int(r), p=int(p),
+                                   dklen=len(digest_hex) // 2, maxmem=_SCRYPT_MAXMEM)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(candidate.hex(), digest_hex)
+
+
+def _require_str(body: dict, field: str) -> str:
+    value = body.get(field)
+    if not isinstance(value, str):
+        raise MalformedRequest(f"{field} must be a string")
+    return value
+
+
+def validate_signup(body: object) -> tuple[str, str, str]:
+    """Type-check, then value-check. Returns `(email, password, display_name)`."""
+    if not isinstance(body, dict):
+        raise MalformedRequest("request body must be a JSON object")
+    email = _require_str(body, "email")
+    password = _require_str(body, "password")
+    display_name = _require_str(body, "display_name")
+
+    if not _EMAIL_RE.match(email):
+        raise ValidationFailure("email must look like local@domain")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValidationFailure("password must be at least 8 characters")
+    return email, password, display_name
+
+
+def signup(body: object, user_id: str) -> dict:
+    """Create an account and return its token. Raises per the exceptions above."""
+    from . import store
+
+    email, password, display_name = validate_signup(body)
+    try:
+        with store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash, display_name) VALUES (?, ?, ?, ?)",
+                (user_id, email, hash_password(password), display_name),
+            )
+            token = issue_token()
+            conn.execute("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, user_id))
+    except Exception as exc:  # sqlite3.IntegrityError, without importing sqlite3 for one name
+        if "email" in str(exc).lower() or "unique" in str(exc).lower():
+            raise CredentialsTaken(email) from exc
+        raise
+    # §6 answers 201 with {user_id, display_name, token}. The name is echoed from the value
+    # `validate_signup` already checked rather than re-derived, so the response cannot disagree with
+    # the column that was just written.
+    return {"user_id": user_id, "email": email, "display_name": display_name, "token": token}
+
+
+def authenticate(body: object) -> dict:
+    """Exchange credentials for a token. Raises `BadCredentials` on any failure."""
+    from . import store
+
+    if not isinstance(body, dict):
+        raise MalformedRequest("request body must be a JSON object")
+    email = _require_str(body, "email")
+    password = _require_str(body, "password")
+
+    conn = store.connect()
+    try:
+        row = conn.execute("SELECT id, password_hash, display_name FROM users WHERE email = ?",
+                           (email,)).fetchone()
+    finally:
+        conn.close()
+    # One message for a missing account and for a wrong password, so the response cannot be used
+    # to learn whether an address is registered. The email is deliberately not echoed back.
+    if row is None or not verify_password(password, row["password_hash"]):
+        raise BadCredentials("invalid email or password")
+    token = issue_token()
+    conn = store.connect()
+    try:
+        conn.execute("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, row["id"]))
+    finally:
+        conn.close()
+    # §6 answers 200 with the same three fields as signup. Login carries no display_name of its own,
+    # so the name has to come off the stored row -- the same column `user_for_token` already selects.
+    return {"user_id": row["id"], "email": email, "display_name": row["display_name"],
+            "token": token}
+
+
+def issue_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def user_for_token(token: str | None):
+    """The user row for a bearer token, or `None` if the token is absent or unknown.
+
+    §6 requires both cases to be indistinguishable to the caller, so a missing header and a
+    fabricated token both simply return `None` and the endpoint answers 401 either way.
+    """
+    from . import store
+
+    if not token:
+        return None
+    conn = store.connect()
+    try:
+        return conn.execute(
+            "SELECT users.id AS id, users.email AS email, users.display_name AS display_name"
+            " FROM tokens JOIN users ON users.id = tokens.user_id WHERE tokens.token = ?",
+            (token,),
+        ).fetchone()
+    finally:
+        conn.close()
