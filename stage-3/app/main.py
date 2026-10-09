@@ -45,6 +45,7 @@ WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # twice over because `date.fromisoformat` rejects what the regex lets through; `party_size` had no
 # second line of defence.
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_HHMM_RE = re.compile(r"^[0-9]{2}:[0-9]{2}$")
 _POSITIVE_INT_RE = re.compile(r"^[0-9]+$")
 _REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -427,6 +428,59 @@ def _day_of(starts_at_local: str) -> str:
     return starts_at_local[:10]
 
 
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _row_accepted_terms(conn, row) -> dict:
+    """The terms a reservation accepted, or policy 0 for a pre-stage-3 row import left unset."""
+    raw = row["accepted_terms"] if "accepted_terms" in row.keys() else None
+    if raw:
+        try:
+            terms = json.loads(raw)
+        except ValueError:
+            terms = None
+        if isinstance(terms, dict):
+            return terms
+    return store.policy_zero(conn, row["restaurant_id"])
+
+
+def _accepted_cutoff_minutes(conn, row) -> int:
+    return int(_row_accepted_terms(conn, row)["cancellation_cutoff_minutes"])
+
+
+def _write_history(conn, reference, event, changes, revision, terms) -> None:
+    """Append one history entry, numbered one past the reservation's current last."""
+    seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM reservation_history WHERE reference = ?",
+        (reference,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO reservation_history (reference, seq, at, event, changes, revision,"
+        " accepted_terms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (reference, seq, _now_iso(), event, json.dumps(changes), revision,
+         json.dumps(terms) if terms is not None else None))
+
+
+def _bump_restaurant_revision(conn, restaurant_id) -> None:
+    conn.execute("UPDATE restaurants SET restaurant_revision = restaurant_revision + 1"
+                 " WHERE id = ?", (restaurant_id,))
+
+
+def _bump_series_revision(conn, series_id) -> None:
+    conn.execute("UPDATE series SET revision = revision + 1 WHERE series_id = ?", (series_id,))
+
+
+def _canonical_table_set(ctx, table_ids) -> list[str]:
+    """Reorder a two-member declared combination to the order the restaurant declared it."""
+    ids = list(table_ids)
+    if len(ids) == 2:
+        wanted = set(ids)
+        for pair in _combinable_pairs(ctx):
+            if set(pair) == wanted:
+                return list(pair)
+    return ids
+
+
 def _table_taken(table_id, occupancy, starts, ends) -> bool:
     return any(table_id in held and overlaps(starts, ends, other_start, other_end)
                for held, other_start, other_end in occupancy)
@@ -798,9 +852,14 @@ def _resolve_table_set(ctx, table_ids):
         tables.append(row)
     if len(tables) == 2:
         wanted = {table["id"] for table in tables}
-        if not any(set(pair) == wanted for pair in _combinable_pairs(ctx)):
+        declared = next((pair for pair in _combinable_pairs(ctx) if set(pair) == wanted), None)
+        if declared is None:
             raise HttpError(422, "combination_not_allowed",
                             "these two tables are not a declared combination")
+        # Table-set order is the declared combination order, so a reversed input pair names the
+        # same set rather than a different one (§Combined-table history).
+        order = {table_id: index for index, table_id in enumerate(declared)}
+        tables.sort(key=lambda table: order[table["id"]])
     return tables
 
 
@@ -885,21 +944,31 @@ def _create_reservation(conn, body, user_id):
     if restaurant is None:
         raise HttpError(404, "not_found", "no such restaurant")
     party_size = body["party_size"]
-    tables, starts = _resolve_booking(conn, restaurant, body, body["starts_at_local"], party_size)
+    ctx = _context(conn, restaurant, _day_of(body["starts_at_local"]))
+    tables, starts = _resolve_booking(conn, ctx, body, body["starts_at_local"], party_size)
 
     reference = _new_reference()
-    created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    created_at = _now_iso()
     table_ids = [table["id"] for table in tables]
-    ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+    terms = _accepted_terms(ctx["policy"])
+    ends = slot_end(starts, ctx["reservation_duration_minutes"])
     conn.execute(
         "INSERT INTO reservations (reference, restaurant_id, table_id, table_ids, user_id,"
-        " starts_at_utc, starts_at_local, ends_at_utc, party_size, status, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)",
+        " starts_at_utc, starts_at_local, ends_at_utc, party_size, status, created_at,"
+        " revision, accepted_terms, series_id, series_index, exception)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, 1, ?, NULL, NULL, 0)",
         (reference, restaurant["id"], table_ids[0], json.dumps(table_ids), user_id,
          starts.astimezone(dt.timezone.utc).isoformat(),
          body["starts_at_local"], ends.astimezone(dt.timezone.utc).isoformat(),
-         party_size, created_at),
+         party_size, created_at, json.dumps(terms)),
     )
+    _write_history(conn, reference, "created", [
+        {"field": "table_id" if len(table_ids) == 1 else "table_ids", "from": None,
+         "to": table_ids[0] if len(table_ids) == 1 else table_ids},
+        {"field": "starts_at_local", "from": None, "to": body["starts_at_local"]},
+        {"field": "party_size", "from": None, "to": party_size},
+    ], 1, terms)
+    _bump_restaurant_revision(conn, restaurant["id"])
     stored = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                           (reference,)).fetchone()
     return 201, _reservation_body(stored, restaurant)
@@ -940,6 +1009,10 @@ def patch_reservation(request, match):
         # §5:172-174: `party_size` strings and booleans are 422 validation_failed; the other two
         # amendment fields keep §5:48's generic wrong-type 400.
         raise _invalid("party_size must be an integer")
+    if "expected_revision" in body:
+        expected = body["expected_revision"]
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
+            raise _invalid("expected_revision must be a positive integer")
 
     reference = match.group("reference")
     conn = store.connect()
@@ -956,10 +1029,13 @@ def patch_reservation(request, match):
             raise HttpError(404, "not_found", "no such reservation")
         if row["status"] == "cancelled":
             raise HttpError(409, "reservation_cancelled", "this reservation is cancelled")
+        # §Policies: a mismatched expected_revision is 409 stale_revision *before* cutoff/validation.
+        if "expected_revision" in body and body["expected_revision"] != row["revision"]:
+            raise HttpError(409, "stale_revision", "the reservation changed since you read it")
 
         restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
                                   (row["restaurant_id"],)).fetchone()
-        _enforce_cutoff(row, restaurant, "amend")
+        _enforce_cutoff(row, _accepted_cutoff_minutes(conn, row), "amend")
 
         # Absent fields keep their stored value, which is what makes the subset literal. A missing
         # table field keeps the reservation's current set, which may be a combination.
@@ -972,21 +1048,55 @@ def patch_reservation(request, match):
         starts_at_local = body.get("starts_at_local", row["starts_at_local"])
         party_size = body.get("party_size", row["party_size"])
 
-        tables, starts = _resolve_booking(conn, restaurant, {"table_ids": requested},
+        ctx = _context(conn, restaurant, _day_of(starts_at_local))
+        stored_tables = _reservation_table_ids(row)
+        table_changed = _canonical_table_set(ctx, requested) != stored_tables
+        starts_changed = starts_at_local != row["starts_at_local"]
+        party_changed = party_size != row["party_size"]
+
+        # §Reservation history: a PATCH that changes nothing succeeds but records no entry and keeps
+        # the accepted terms, end time and revision. It still requires a confirmed, editable booking,
+        # which the cutoff check above already enforced.
+        if not (table_changed or starts_changed or party_changed):
+            conn.execute("COMMIT")
+            return 200, _reservation_body(row, restaurant)
+
+        # A real amendment validates all resulting fields against the resulting date's policy, then
+        # atomically replaces terms and end time and increments the revision once.
+        tables, starts = _resolve_booking(conn, ctx, {"table_ids": requested},
                                           starts_at_local, party_size,
                                           exclude_reference=reference)
         table_ids = [table["id"] for table in tables]
-        ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+        terms = _accepted_terms(ctx["policy"])
+        revision = row["revision"] + 1
+        ends = slot_end(starts, ctx["reservation_duration_minutes"])
 
         # `reference` and `status` are deliberately absent from the SET list: the spec requires both
         # to survive an amendment.
         conn.execute(
             "UPDATE reservations SET table_id = ?, table_ids = ?, starts_at_local = ?,"
-            " starts_at_utc = ?, ends_at_utc = ?, party_size = ? WHERE reference = ?",
+            " starts_at_utc = ?, ends_at_utc = ?, party_size = ?, revision = ?,"
+            " accepted_terms = ?, exception = ? WHERE reference = ?",
             (table_ids[0], json.dumps(table_ids), starts_at_local,
              starts.astimezone(dt.timezone.utc).isoformat(),
-             ends.astimezone(dt.timezone.utc).isoformat(), party_size, reference),
+             ends.astimezone(dt.timezone.utc).isoformat(), party_size, revision,
+             json.dumps(terms), 1 if row["series_id"] else row["exception"], reference),
         )
+        changes = []
+        if table_changed:
+            if len(stored_tables) == 1 and len(table_ids) == 1:
+                changes.append({"field": "table_id", "from": stored_tables[0], "to": table_ids[0]})
+            else:
+                changes.append({"field": "table_ids", "from": stored_tables, "to": table_ids})
+        if starts_changed:
+            changes.append({"field": "starts_at_local", "from": row["starts_at_local"],
+                            "to": starts_at_local})
+        if party_changed:
+            changes.append({"field": "party_size", "from": row["party_size"], "to": party_size})
+        _write_history(conn, reference, "changed", changes, revision, terms)
+        if row["series_id"]:
+            _bump_series_revision(conn, row["series_id"])
+        _bump_restaurant_revision(conn, restaurant["id"])
         updated = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                (reference,)).fetchone()
         conn.execute("COMMIT")
@@ -1041,12 +1151,20 @@ def cancel_reservation(request, match):
 
         restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
                                   (row["restaurant_id"],)).fetchone()
-        _enforce_cutoff(row, restaurant, "cancel")
+        _enforce_cutoff(row, _accepted_cutoff_minutes(conn, row), "cancel")
 
         # Only `status` moves. §10:175 keeps identities and timestamps from being regenerated, so
         # `reference`, `reservation_id` and `created_at` all survive a cancellation untouched.
-        conn.execute("UPDATE reservations SET status = 'cancelled' WHERE reference = ?",
-                     (reference,))
+        # §Policies: cancel increments the revision once and keeps the accepted terms; a series
+        # occurrence's cancellation bumps its series revision once but is not a diner exception.
+        revision = row["revision"] + 1
+        terms = _row_accepted_terms(conn, row)
+        conn.execute("UPDATE reservations SET status = 'cancelled', revision = ?"
+                     " WHERE reference = ?", (revision, reference))
+        _write_history(conn, reference, "cancelled", [], revision, terms)
+        if row["series_id"]:
+            _bump_series_revision(conn, row["series_id"])
+        _bump_restaurant_revision(conn, restaurant["id"])
         updated = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                (reference,)).fetchone()
         conn.execute("COMMIT")
@@ -1142,7 +1260,15 @@ def post_reservation_moves(request, match):
                                           (row["restaurant_id"],)).fetchone()
             elif row["restaurant_id"] != restaurant["id"]:
                 raise _invalid("every booking in a batch must be at the same restaurant")
-            _enforce_cutoff(row, restaurant, "amend")
+            # §Collective moves: each move carries PATCH's optional per-move expected_revision.
+            if "expected_revision" in item:
+                expected = item["expected_revision"]
+                if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
+                    raise _invalid("expected_revision must be a positive integer")
+                if expected != row["revision"]:
+                    raise HttpError(409, "stale_revision",
+                                    "the reservation changed since you read it")
+            _enforce_cutoff(row, _accepted_cutoff_minutes(conn, row), "amend")
 
             # Absent fields keep their stored value, exactly as an amendment's subset does (:192).
             starts_at_local = item.get("starts_at_local", row["starts_at_local"])
@@ -1166,10 +1292,27 @@ def post_reservation_moves(request, match):
                 requested = [item["table_id"]]
             else:
                 requested = _reservation_table_ids(row)
-            tables = _resolve_table_set(conn, restaurant, requested)
-            starts = _validate_booking_fields(conn, restaurant, tables,
-                                              starts_at_local, party_size)
-            planned.append((reference, tables, starts, starts_at_local, party_size))
+            ctx = _context(conn, restaurant, _day_of(starts_at_local))
+            stored_tables = _reservation_table_ids(row)
+            real = (_canonical_table_set(ctx, requested) != stored_tables
+                    or starts_at_local != row["starts_at_local"]
+                    or party_size != row["party_size"])
+            if real:
+                # A real change adopts the resulting date's policy and validates every field.
+                tables = _resolve_table_set(ctx, requested)
+                starts = _validate_booking_fields(ctx, tables, starts_at_local, party_size)
+                terms = _accepted_terms(ctx["policy"])
+                ends = slot_end(starts, ctx["reservation_duration_minutes"])
+            else:
+                # A no-op retains its terms, history and revision but still holds its slot.
+                by_id = {table["id"]: table for table in ctx["tables"]}
+                tables = [by_id[t] for t in stored_tables if t in by_id]
+                starts = dt.datetime.fromisoformat(row["starts_at_utc"])
+                terms = None
+                ends = (dt.datetime.fromisoformat(row["ends_at_utc"]) if row["ends_at_utc"]
+                        else slot_end(starts, ctx["reservation_duration_minutes"]))
+            planned.append((reference, row, tables, starts, starts_at_local, party_size,
+                            real, terms, ends))
 
         # Pass two: occupancy against the batch's *resulting* state, not the pre-batch one.
         # Checking each item against the live table would refuse a conflict-free swap: the first
@@ -1180,12 +1323,14 @@ def post_reservation_moves(request, match):
         # who tries to take its slot) -- and against every booking that is not moving (:199 "or
         # with an unlisted booking"). The checks run in input order, so :197's ordering is
         # preserved for occupancy conflicts as well as non-occupancy errors.
-        listed = [reference for reference, _tables, _starts, _s, _p in planned]
+        listed = [reference for reference, _row, _tables, _starts, _s, _p, _r, _t, _e in planned]
         in_clause = ", ".join("?" for _ in listed)
         compiled = []
         results = []
-        for reference, tables, starts, starts_at_local, party_size in planned:
-            ends = slot_end(starts, restaurant["reservation_duration_minutes"])
+        touched_series = set()
+        any_real = False
+        for (reference, row, tables, starts, starts_at_local, party_size,
+             real, terms, ends) in planned:
             wanted = {table["id"] for table in tables}
             for other_tables, other_starts, other_ends in compiled:
                 if wanted & {table["id"] for table in other_tables} \
@@ -1194,30 +1339,60 @@ def post_reservation_moves(request, match):
             clash = ("SELECT table_id, table_ids, starts_at_utc, ends_at_utc FROM reservations"
                      " WHERE restaurant_id = ? AND status != 'cancelled'"
                      f" AND reference NOT IN ({in_clause})")
-            for row in conn.execute(clash, (restaurant["id"], *listed)).fetchall():
-                if not (set(_reservation_table_ids(row)) & wanted):
+            for other in conn.execute(clash, (restaurant["id"], *listed)).fetchall():
+                if not (set(_reservation_table_ids(other)) & wanted):
                     continue
-                other_start = dt.datetime.fromisoformat(row["starts_at_utc"])
-                other_end = (dt.datetime.fromisoformat(row["ends_at_utc"])
-                             if row["ends_at_utc"]
+                other_start = dt.datetime.fromisoformat(other["starts_at_utc"])
+                other_end = (dt.datetime.fromisoformat(other["ends_at_utc"])
+                             if other["ends_at_utc"]
                              else slot_end(other_start,
                                            restaurant["reservation_duration_minutes"]))
                 if overlaps(starts, ends, other_start, other_end):
                     raise HttpError(409, "table_unavailable", "that table is already booked")
-            table_ids = [table["id"] for table in tables]
-            # `reference`, `status`, `user_id` and `created_at` are deliberately absent from the SET
-            # list: §11:194 keeps identity, owner and creation time unchanged through a move.
-            conn.execute(
-                "UPDATE reservations SET table_id = ?, table_ids = ?, starts_at_local = ?,"
-                " starts_at_utc = ?, ends_at_utc = ?, party_size = ? WHERE reference = ?",
-                (table_ids[0], json.dumps(table_ids), starts_at_local,
-                 starts.astimezone(dt.timezone.utc).isoformat(),
-                 ends.astimezone(dt.timezone.utc).isoformat(), party_size, reference),
-            )
+            if real:
+                table_ids = [table["id"] for table in tables]
+                stored_tables = _reservation_table_ids(row)
+                revision = row["revision"] + 1
+                # `reference`, `status`, `user_id` and `created_at` are deliberately absent from
+                # the SET list: §11:194 keeps identity, owner and creation time unchanged.
+                conn.execute(
+                    "UPDATE reservations SET table_id = ?, table_ids = ?, starts_at_local = ?,"
+                    " starts_at_utc = ?, ends_at_utc = ?, party_size = ?, revision = ?,"
+                    " accepted_terms = ?, exception = ? WHERE reference = ?",
+                    (table_ids[0], json.dumps(table_ids), starts_at_local,
+                     starts.astimezone(dt.timezone.utc).isoformat(),
+                     ends.astimezone(dt.timezone.utc).isoformat(), party_size, revision,
+                     json.dumps(terms), 1 if row["series_id"] else row["exception"], reference),
+                )
+                changes = []
+                if stored_tables != table_ids:
+                    if len(stored_tables) == 1 and len(table_ids) == 1:
+                        changes.append({"field": "table_id", "from": stored_tables[0],
+                                        "to": table_ids[0]})
+                    else:
+                        changes.append({"field": "table_ids", "from": stored_tables,
+                                        "to": table_ids})
+                if starts_at_local != row["starts_at_local"]:
+                    changes.append({"field": "starts_at_local", "from": row["starts_at_local"],
+                                    "to": starts_at_local})
+                if party_size != row["party_size"]:
+                    changes.append({"field": "party_size", "from": row["party_size"],
+                                    "to": party_size})
+                _write_history(conn, reference, "changed", changes, revision, terms)
+                if row["series_id"]:
+                    touched_series.add(row["series_id"])
+                any_real = True
             moved = conn.execute("SELECT * FROM reservations WHERE reference = ?",
                                  (reference,)).fetchone()
             results.append(_reservation_body(moved, restaurant))
             compiled.append((tables, starts, ends))
+
+        # §Collective moves: each affected series revision increases once, and each changed series
+        # occurrence becomes a permanent diner exception; the restaurant revision increases once.
+        for series_id in touched_series:
+            _bump_series_revision(conn, series_id)
+        if any_real:
+            _bump_restaurant_revision(conn, restaurant["id"])
 
         created = (201, {"reservations": results})
         conn.execute(
@@ -1304,6 +1479,9 @@ def _reservation_body(row, restaurant=None):
         ends = slot_end(starts, restaurant["reservation_duration_minutes"]).astimezone(zone)
     created = dt.datetime.fromisoformat(row["created_at"])
     table_ids = _reservation_table_ids(row)
+    terms_raw = row["accepted_terms"] if "accepted_terms" in row.keys() else None
+    terms = json.loads(terms_raw) if terms_raw else None
+    revision = row["revision"] if "revision" in row.keys() else 1
     body = {
         "reference": row["reference"],
         "reservation_id": row["reference"],
@@ -1321,12 +1499,430 @@ def _reservation_body(row, restaurant=None):
         "party_size": row["party_size"],
         "status": row["status"],
         "created_at": format_instant(created),
+        "revision": revision,
+        "accepted_terms": terms,
     }
     # §8: "When the set has one member the response still carries `table_id`"; a two-member set
     # omits it, because `table_ids` is then the whole statement of what was booked.
     if len(table_ids) == 1:
         body["table_id"] = table_ids[0]
     return body
+
+
+# ---- stage 3: history and decision -----------------------------------------------------------
+
+
+def get_history(request, match):
+    """`GET /reservations/{reference}/history` -- the owner's own record, oldest first.
+
+    §Reservation history: only the owner may read it, and "anyone else, signed in or not, gets the
+    same 404 `not_found`". That is why the owner is resolved optionally and a missing token and a
+    mismatched owner are answered identically here, rather than by `require_user`'s 401.
+    """
+    user = request.optional_user()
+    reference = match.group("reference")
+    conn = store.connect()
+    try:
+        owner = conn.execute("SELECT user_id FROM reservations WHERE reference = ?",
+                             (reference,)).fetchone()
+        if owner is None or user is None or owner["user_id"] != user["id"]:
+            raise HttpError(404, "not_found", "no such reservation")
+        rows = conn.execute(
+            "SELECT seq, at, event, changes, revision, accepted_terms FROM reservation_history"
+            " WHERE reference = ? ORDER BY seq", (reference,)).fetchall()
+    finally:
+        conn.close()
+    entries = []
+    for row in rows:
+        raw = row["accepted_terms"]
+        entries.append({
+            "seq": row["seq"],
+            "at": row["at"],
+            "event": row["event"],
+            "changes": json.loads(row["changes"]),
+            "revision": row["revision"],
+            "accepted_terms": json.loads(raw) if raw else None,
+        })
+    return 200, {"reference": reference, "entries": entries}
+
+
+def get_decision(request, match):
+    """`GET /reservations/{reference}/decision` -- current revision and accepted terms.
+
+    Same owner-only 404 rule as history, including "even without authentication", and it still
+    answers for a cancelled booking.
+    """
+    user = request.optional_user()
+    reference = match.group("reference")
+    conn = store.connect()
+    try:
+        row = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                           (reference,)).fetchone()
+        if row is None or user is None or row["user_id"] != user["id"]:
+            raise HttpError(404, "not_found", "no such reservation")
+        terms = _row_accepted_terms(conn, row)
+        revision = row["revision"]
+    finally:
+        conn.close()
+    return 200, {"reference": reference, "revision": revision, "accepted_terms": terms}
+
+
+# ---- stage 3: policies -----------------------------------------------------------------------
+
+
+def _policy_body(row) -> dict:
+    return {
+        "effective_from": row["effective_from"],
+        "slot_minutes": row["slot_minutes"],
+        "reservation_duration_minutes": row["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": row["cancellation_cutoff_minutes"],
+        "opening_hours": json.loads(row["opening_hours"]),
+        "capacities": json.loads(row["capacities"]),
+        "policy_version": row["policy_version"],
+    }
+
+
+def _valid_hhmm(value) -> bool:
+    if not isinstance(value, str) or not _HHMM_RE.match(value):
+        return False
+    hour, minute = value.split(":")
+    return 0 <= int(hour) <= 23 and 0 <= int(minute) <= 59
+
+
+def _validate_policy(body, table_ids) -> dict:
+    """A complete policy, or 422 `validation_failed`.
+
+    §Policies: all six fields are required; grid and duration are integers 1..1440; cutoff is an
+    integer 0..10080; booleans are not integers; opening hours follow stage 1 with no duplicate
+    weekdays; `capacities` names exactly the restaurant's tables with integer capacities 1..100.
+    Table ids, labels, timezone and combinations cannot be changed, and unknown fields are ignored.
+    """
+    if not isinstance(body, dict):
+        raise _invalid("policy must be a JSON object")
+    for field in ("effective_from", "slot_minutes", "reservation_duration_minutes",
+                  "cancellation_cutoff_minutes", "opening_hours", "capacities"):
+        if field not in body:
+            raise _invalid(f"{field} is required")
+
+    effective_from = body["effective_from"]
+    if not isinstance(effective_from, str) or not _DATE_RE.match(effective_from):
+        raise _invalid("effective_from must be a YYYY-MM-DD date")
+    try:
+        dt.date.fromisoformat(effective_from)
+    except ValueError as exc:
+        raise _invalid("effective_from is not a real calendar date") from exc
+
+    for field in ("slot_minutes", "reservation_duration_minutes"):
+        value = body[field]
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 1440:
+            raise _invalid(f"{field} must be an integer between 1 and 1440")
+    cutoff = body["cancellation_cutoff_minutes"]
+    if not isinstance(cutoff, int) or isinstance(cutoff, bool) or not 0 <= cutoff <= 10080:
+        raise _invalid("cancellation_cutoff_minutes must be an integer between 0 and 10080")
+
+    hours = body["opening_hours"]
+    if not isinstance(hours, list):
+        raise _invalid("opening_hours must be an array")
+    seen = set()
+    windows = []
+    for window in hours:
+        if not isinstance(window, dict):
+            raise _invalid("each opening_hours entry must be an object")
+        weekday = window.get("weekday")
+        if weekday not in WEEKDAYS:
+            raise _invalid("opening_hours.weekday is not a day of the week")
+        if weekday in seen:
+            raise _invalid("opening_hours must not repeat a weekday")
+        seen.add(weekday)
+        opens, closes = window.get("opens"), window.get("closes")
+        if not _valid_hhmm(opens) or not _valid_hhmm(closes):
+            raise _invalid("opening hours must be a valid HH:MM time")
+        if minutes_of(opens) >= minutes_of(closes):
+            raise _invalid("opening hours must open before they close")
+        windows.append({"weekday": weekday, "opens": opens, "closes": closes})
+
+    capacities = body["capacities"]
+    if not isinstance(capacities, dict):
+        raise _invalid("capacities must be an object")
+    if set(capacities) != set(table_ids):
+        raise _invalid("capacities must name exactly this restaurant's tables")
+    clean = {}
+    for table_id, value in capacities.items():
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
+            raise _invalid("each capacity must be an integer between 1 and 100")
+        clean[table_id] = value
+
+    return {
+        "effective_from": effective_from,
+        "slot_minutes": body["slot_minutes"],
+        "reservation_duration_minutes": body["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": cutoff,
+        "opening_hours": windows,
+        "capacities": clean,
+    }
+
+
+def post_policy(request, match):
+    """`POST /restaurants/{id}/policies` -- publish an immutable, versioned policy."""
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is None or key == "":
+        raise HttpError(400, "missing_idempotency_key", "Idempotency-Key is required")
+    if not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("request body must be a JSON object")
+
+    request_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    scope = request.idempotency_scope()
+
+    conn = store.connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute("SELECT request_hash, response_body FROM idempotency"
+                              " WHERE key = ? AND user_id = ? AND scope = ?",
+                              (key, user["id"], scope)).fetchone()
+        if stored is not None:
+            if stored["request_hash"] != request_hash:
+                raise HttpError(409, "idempotency_key_reuse",
+                                "this key was used with a different request body")
+            replay = json.loads(stored["response_body"])
+            conn.execute("COMMIT")
+            return 200, replay
+
+        restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                  (match.group("id"),)).fetchone()
+        if restaurant is None:
+            raise HttpError(404, "not_found", "no such restaurant")
+        if user["id"] not in _json_list(restaurant["manager_user_ids"]):
+            raise HttpError(403, "forbidden", "only a manager may publish a policy")
+        table_ids = [row["id"] for row in conn.execute(
+            "SELECT id FROM tables WHERE restaurant_id = ? ORDER BY ordinal, id",
+            (restaurant["id"],)).fetchall()]
+        policy = _validate_policy(body, table_ids)
+        # A failed write or replay allocates no version, so the next successful one takes the
+        # smallest unused integer past the current maximum.
+        version = conn.execute(
+            "SELECT COALESCE(MAX(policy_version), 0) + 1 FROM policies WHERE restaurant_id = ?",
+            (restaurant["id"],)).fetchone()[0]
+        conn.execute(
+            "INSERT INTO policies (restaurant_id, policy_version, effective_from, slot_minutes,"
+            " reservation_duration_minutes, cancellation_cutoff_minutes, opening_hours, capacities,"
+            " published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (restaurant["id"], version, policy["effective_from"], policy["slot_minutes"],
+             policy["reservation_duration_minutes"], policy["cancellation_cutoff_minutes"],
+             json.dumps(policy["opening_hours"]), json.dumps(policy["capacities"]), _now_iso()))
+        published = {**policy, "policy_version": version}
+        _bump_restaurant_revision(conn, restaurant["id"])
+        conn.execute("INSERT INTO idempotency (key, user_id, scope, request_hash, status_code,"
+                     " response_body) VALUES (?, ?, ?, ?, 201, ?)",
+                     (key, user["id"], scope, request_hash, json.dumps(published)))
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the rollback failure is not the interesting error
+            pass
+        raise
+    finally:
+        conn.close()
+    return 201, published
+
+
+def list_policies(request, match):
+    """`GET /restaurants/{id}/policies` -- public, publication order, policy 0 omitted."""
+    conn = store.connect()
+    try:
+        restaurant = conn.execute("SELECT id FROM restaurants WHERE id = ?",
+                                  (match.group("id"),)).fetchone()
+        if restaurant is None:
+            raise HttpError(404, "not_found", "no such restaurant")
+        rows = conn.execute("SELECT * FROM policies WHERE restaurant_id = ?"
+                            " ORDER BY policy_version", (restaurant["id"],)).fetchall()
+    finally:
+        conn.close()
+    return 200, {"policies": [_policy_body(row) for row in rows]}
+
+
+# ---- stage 3: recurring reservations ---------------------------------------------------------
+
+
+def _new_series_id() -> str:
+    return "s_" + secrets.token_hex(8)
+
+
+def _unique_reference(conn) -> str:
+    while True:
+        reference = _new_reference()
+        if conn.execute("SELECT 1 FROM reservations WHERE reference = ?",
+                        (reference,)).fetchone() is None:
+            return reference
+
+
+def _series_occurrence(row, restaurant) -> dict:
+    return {
+        "index": row["series_index"],
+        "reference": row["reference"],
+        "exception": bool(row["exception"]),
+        "reservation": _reservation_body(row, restaurant),
+    }
+
+
+def post_series(request, match):
+    """`POST /series` -- adopt a booking as occurrence zero of a recurring agreement."""
+    user = request.require_user()
+    key = request.headers.get("Idempotency-Key")
+    if key is None or key == "":
+        raise HttpError(400, "missing_idempotency_key", "Idempotency-Key is required")
+    if not 1 <= len(key) <= 255:
+        raise _invalid("Idempotency-Key must be 1..255 characters")
+
+    body = request.json_body()
+    if not isinstance(body, dict):
+        raise _malformed("request body must be a JSON object")
+
+    request_hash = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    scope = request.idempotency_scope()
+
+    conn = store.connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute("SELECT request_hash, response_body FROM idempotency"
+                              " WHERE key = ? AND user_id = ? AND scope = ?",
+                              (key, user["id"], scope)).fetchone()
+        if stored is not None:
+            if stored["request_hash"] != request_hash:
+                raise HttpError(409, "idempotency_key_reuse",
+                                "this key was used with a different request body")
+            replay = json.loads(stored["response_body"])
+            conn.execute("COMMIT")
+            return 200, replay
+
+        anchor_reference = body.get("anchor_reference")
+        if not isinstance(anchor_reference, str):
+            raise _invalid("anchor_reference is required")
+        count = body.get("count")
+        if not isinstance(count, int) or isinstance(count, bool) or not 2 <= count <= 12:
+            raise _invalid("count must be an integer between 2 and 12")
+        interval_weeks = body.get("interval_weeks")
+        if (not isinstance(interval_weeks, int) or isinstance(interval_weeks, bool)
+                or not 1 <= interval_weeks <= 4):
+            raise _invalid("interval_weeks must be an integer between 1 and 4")
+
+        anchor = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                              (anchor_reference,)).fetchone()
+        if anchor is None or anchor["user_id"] != user["id"]:
+            raise HttpError(404, "not_found", "no such reservation")
+        if anchor["status"] == "cancelled":
+            raise HttpError(409, "reservation_cancelled", "this reservation is cancelled")
+        if anchor["series_id"] is not None:
+            raise HttpError(409, "already_in_series",
+                            "this reservation already belongs to a series")
+        _enforce_cutoff(anchor, _accepted_cutoff_minutes(conn, anchor), "amend")
+
+        restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                  (anchor["restaurant_id"],)).fetchone()
+        base_date = dt.date.fromisoformat(_day_of(anchor["starts_at_local"]))
+        clock = anchor["starts_at_local"][11:]
+        party_size = anchor["party_size"]
+        anchor_tables = _reservation_table_ids(anchor)
+
+        series_id = _new_series_id()
+        conn.execute(
+            "INSERT INTO series (series_id, user_id, restaurant_id, anchor_reference,"
+            " interval_weeks, revision, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (series_id, user["id"], restaurant["id"], anchor_reference, interval_weeks,
+             _now_iso()))
+        # Occurrence zero is the anchor itself: only its series membership changes.
+        conn.execute("UPDATE reservations SET series_id = ?, series_index = 0, exception = 0"
+                     " WHERE reference = ?", (series_id, anchor_reference))
+
+        anchor_row = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                                  (anchor_reference,)).fetchone()
+        occurrences = [{"index": 0, "reference": anchor_reference, "exception": False,
+                        "reservation": _reservation_body(anchor_row, restaurant)}]
+
+        # Each generated occurrence independently selects its date's policy and obeys the ordinary
+        # opening, DST and occupancy rules. The first failure in index order is the batch's error,
+        # and nothing partial survives because every write shares this one transaction.
+        for index in range(1, count):
+            date_i = base_date + dt.timedelta(weeks=index * interval_weeks)
+            starts_at_local = f"{date_i.isoformat()}T{clock}"
+            ctx = _context(conn, restaurant, date_i.isoformat())
+            tables = _resolve_table_set(ctx, anchor_tables)
+            starts = _validate_booking_fields(ctx, tables, starts_at_local, party_size)
+            _assert_tables_free(conn, ctx, tables, starts)
+            reference = _unique_reference(conn)
+            table_ids = [table["id"] for table in tables]
+            terms = _accepted_terms(ctx["policy"])
+            created_at = _now_iso()
+            ends = slot_end(starts, ctx["reservation_duration_minutes"])
+            conn.execute(
+                "INSERT INTO reservations (reference, restaurant_id, table_id, table_ids, user_id,"
+                " starts_at_utc, starts_at_local, ends_at_utc, party_size, status, created_at,"
+                " revision, accepted_terms, series_id, series_index, exception)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, 1, ?, ?, ?, 0)",
+                (reference, restaurant["id"], table_ids[0], json.dumps(table_ids), user["id"],
+                 starts.astimezone(dt.timezone.utc).isoformat(), starts_at_local,
+                 ends.astimezone(dt.timezone.utc).isoformat(), party_size, created_at,
+                 json.dumps(terms), series_id, index))
+            _write_history(conn, reference, "created", [
+                {"field": "table_id" if len(table_ids) == 1 else "table_ids", "from": None,
+                 "to": table_ids[0] if len(table_ids) == 1 else table_ids},
+                {"field": "starts_at_local", "from": None, "to": starts_at_local},
+                {"field": "party_size", "from": None, "to": party_size},
+            ], 1, terms)
+            generated_row = conn.execute("SELECT * FROM reservations WHERE reference = ?",
+                                         (reference,)).fetchone()
+            occurrences.append({"index": index, "reference": reference, "exception": False,
+                                "reservation": _reservation_body(generated_row, restaurant)})
+
+        # §Recurring reservations: adoption increments the restaurant revision once.
+        _bump_restaurant_revision(conn, restaurant["id"])
+        result = {"series_id": series_id, "revision": 1, "interval_weeks": interval_weeks,
+                  "occurrences": occurrences}
+        conn.execute("INSERT INTO idempotency (key, user_id, scope, request_hash, status_code,"
+                     " response_body) VALUES (?, ?, ?, ?, 201, ?)",
+                     (key, user["id"], scope, request_hash, json.dumps(result)))
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the rollback failure is not the interesting error
+            pass
+        raise
+    finally:
+        conn.close()
+    return 201, result
+
+
+def get_series(request, match):
+    """`GET /series/{series_id}` -- the owner's agreement with current reservation states."""
+    user = request.optional_user()
+    series_id = match.group("series_id")
+    conn = store.connect()
+    try:
+        series = conn.execute("SELECT * FROM series WHERE series_id = ?",
+                              (series_id,)).fetchone()
+        if series is None or user is None or series["user_id"] != user["id"]:
+            raise HttpError(404, "not_found", "no such series")
+        restaurant = conn.execute("SELECT * FROM restaurants WHERE id = ?",
+                                  (series["restaurant_id"],)).fetchone()
+        rows = conn.execute("SELECT * FROM reservations WHERE series_id = ?"
+                            " ORDER BY series_index", (series_id,)).fetchall()
+        result = {
+            "series_id": series_id,
+            "revision": series["revision"],
+            "interval_weeks": series["interval_weeks"],
+            "occurrences": [_series_occurrence(row, restaurant) for row in rows],
+        }
+    finally:
+        conn.close()
+    return 200, result
 
 
 class Html:
@@ -1757,13 +2353,19 @@ ROUTES = [
     ("POST", re.compile(r"^/auth/login$"), post_login),
     ("GET", re.compile(r"^/restaurants$"), list_restaurants),
     ("GET", re.compile(r"^/restaurants/(?P<id>[^/]+)$"), get_restaurant),
+    ("GET", re.compile(r"^/restaurants/(?P<id>[^/]+)/policies$"), list_policies),
+    ("POST", re.compile(r"^/restaurants/(?P<id>[^/]+)/policies$"), post_policy),
     ("GET", re.compile(r"^/availability$"), get_availability),
     ("POST", re.compile(r"^/reservations$"), post_reservation),
     ("GET", re.compile(r"^/reservations$"), list_reservations),
     ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), get_reservation),
     ("PATCH", re.compile(r"^/reservations/(?P<reference>[^/]+)$"), patch_reservation),
+    ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)/history$"), get_history),
+    ("GET", re.compile(r"^/reservations/(?P<reference>[^/]+)/decision$"), get_decision),
     ("POST", re.compile(r"^/reservation-moves$"), post_reservation_moves),
     ("POST", re.compile(r"^/reservations/(?P<reference>[^/]+)/cancel$"), cancel_reservation),
+    ("POST", re.compile(r"^/series$"), post_series),
+    ("GET", re.compile(r"^/series/(?P<series_id>[^/]+)$"), get_series),
 ]
 
 
@@ -1777,6 +2379,7 @@ class Request:
         self.query = {k: v[-1] for k, v in
                       urllib.parse.parse_qs(handler.path.partition("?")[2]).items()}
         self.user = None
+        self._body = None
 
     def idempotency_scope(self) -> str:
         """§7:79 scopes a replay to "same user, same method, same path, same body".
@@ -1788,8 +2391,23 @@ class Request:
         return f"{self.handler.command} {self.path}"
 
     def raw_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length") or 0)
-        return self.handler.rfile.read(length) if length else b""
+        if self._body is None:
+            length = int(self.headers.get("Content-Length") or 0)
+            self._body = self.handler.rfile.read(length) if length else b""
+        return self._body
+
+    def drain_body(self) -> None:
+        """Consume an unread request body so the connection stays in sync.
+
+        `BaseHTTPRequestHandler` keeps the connection alive for HTTP/1.1 and reads the next request
+        line straight from the socket. A handler that refuses before touching the body -- every 401
+        and the 404s raised before field checks -- would otherwise leave that many bytes in the
+        stream, and the *next* request on the same connection would be parsed starting mid-body
+        (a 400, or a 501 for a nonsense verb). Reading the body here costs nothing and keeps a
+        caller that reuses one connection honest.
+        """
+        if self._body is None:
+            self.raw_body()
 
     def json_body(self):
         raw = self.raw_body()
@@ -1819,6 +2437,16 @@ class Request:
             raise HttpError(401, "unauthenticated", "a valid bearer token is required")
         return self.user
 
+    def optional_user(self):
+        """The authenticated user, or `None` -- for history/decision, whose non-owner reply is 404.
+
+        §Policies: "History and decision return 404 even without authentication, resolving the
+        exception to stage 1's general 401 rule." So these routes must not call `require_user`.
+        """
+        if self.user is None:
+            self.user = auth.user_for_token(self.bearer_token())
+        return self.user
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1826,6 +2454,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         path = urllib.parse.urlsplit(self.path).path
+        request = Request(self)
         try:
             for candidate_method, pattern, handler in ROUTES:
                 if candidate_method != method:
@@ -1833,20 +2462,24 @@ class Handler(BaseHTTPRequestHandler):
                 match = pattern.match(path)
                 if match is None:
                     continue
-                request = Request(self)
                 status, body = handler(request, match)
-                self._respond(status, body)
-                return
-            self._respond(404, {"error": {"code": "not_found",
-                                          "message": f"no route for {method} {path}"}})
+                break
+            else:
+                status = 404
+                body = {"error": {"code": "not_found",
+                                  "message": f"no route for {method} {path}"}}
         except HttpError as exc:
-            self._respond(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+            status, body = exc.status, {"error": {"code": exc.code, "message": exc.message}}
         except Exception as exc:  # noqa: BLE001 - a bug must be a 500, not a hung connection
             correlation = _new_correlation_id()
             log.exception("unhandled exception (correlation %s)", correlation)
-            self._respond(500, {"error": {"code": "internal_error",
-                                          "message": GENERIC_500_MESSAGE,
-                                          "correlation_id": correlation}})
+            status, body = 500, {"error": {"code": "internal_error",
+                                           "message": GENERIC_500_MESSAGE,
+                                           "correlation_id": correlation}}
+        # Drain before answering so an error raised ahead of the body read cannot desync the next
+        # request on this keep-alive connection.
+        request.drain_body()
+        self._respond(status, body)
 
     def _respond(self, status: int, body) -> None:
         if isinstance(body, Html):
