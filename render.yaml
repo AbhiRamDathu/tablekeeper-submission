@@ -1,0 +1,24 @@
+# Render Blueprint for the Tablekeeper demo service.
+#
+# The repository holds four self-contained stages; the completed submission is
+# stage-4/, which carries every earlier stage forward and also serves the
+# browser UI at `/`. Earlier stages do not: stage-1 is API-only and `GET /`
+# answers 404 `not_found` ("no route for GET /") on purpose, because the spec
+# never defines a root route for it. Pinning the deployed service to the
+# completed stage here makes the root URL serve the application UI and the
+# documented liveness probe (`GET /health` -> 200 `{"status": "ok"}`, the
+# delivery contract in REQUIREMENTS.md section 3.2) work.
+#
+# Render reads this file at the repository root when a Blueprint is created in
+# the dashboard ("New +" -> "Blueprint") or an existing service's Dockerfile
+# path is pointed at `stage-4/Dockerfile`. No application code is changed by
+# this file; it only selects which of the four shipped stages is deployed.
+services:
+  - type: web
+    name: tablekeeper
+    runtime: docker
+    plan: starter
+    branch: main
+    dockerfilePath: stage-4/Dockerfile
+    dockerContext: stage-4
+    healthCheckPath: /health
