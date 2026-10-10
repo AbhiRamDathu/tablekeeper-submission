@@ -2514,20 +2514,109 @@ _UI_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tablekeeper</title>
 <style>
- body{font-family:system-ui,Arial,sans-serif;margin:0;color:#1c1c1c}
- header{border-bottom:1px solid #ddd;padding:.5rem 1rem}
- header nav a{margin-right:.75rem}
- main{padding:1rem;max-width:760px}
- label{display:block;margin:.5rem 0}
- input,select,button{font:inherit;padding:.35rem}
- .slot{display:flex;align-items:center;gap:.4rem;margin:.2rem 0}
- .cell{padding:.2rem .5rem;border:1px solid #999;background:#eaf7ea}
- .cell[data-available='false']{background:#f2f2f2;color:#999}
- .combo{background:#e6eefc}
- [data-testid='availability-grid']{margin-top:1rem}
- [data-testid='booking-form'],[data-testid='confirmation']{margin-top:1rem;border-top:1px dashed #ccc;padding-top:.5rem}
- [data-testid='auth-error'],[data-testid='booking-error'],[data-testid='reservation-error']{color:#b00020;margin:.5rem 0}
- [data-testid='booking-uncertain']{color:#8a6d00;margin:.5rem 0}
+ :root{
+   --bg:#f6f4ef;
+   --surface:#ffffff;
+   --ink:#1f211e;
+   --muted:#6a6f68;
+   --line:#e5e1d8;
+   --brand:#1f5f4a;
+   --brand-ink:#123c2f;
+   --brand-soft:#e8f2ec;
+   --accent:#c2591f;
+   --ok:#1f7a4d;
+   --ok-soft:#e7f4ec;
+   --ok-line:#bfe0cd;
+   --warn:#8a5a00;
+   --warn-soft:#fdf4e0;
+   --warn-line:#ecd9b0;
+   --danger:#a4262c;
+   --danger-soft:#fbeaeb;
+   --danger-line:#f0c9cc;
+   --radius:14px;
+   --shadow:0 1px 2px rgba(20,25,20,.05),0 10px 28px rgba(20,25,20,.07);
+   --maxw:960px;
+ }
+ *{box-sizing:border-box}
+ html,body{margin:0}
+ body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+   color:var(--ink);background:linear-gradient(180deg,#fbfaf7 0%,var(--bg) 220px);
+   line-height:1.5;-webkit-font-smoothing:antialiased}
+ a{color:var(--brand);text-decoration:none}
+ a:hover{text-decoration:underline}
+ :focus-visible{outline:3px solid var(--brand);outline-offset:2px;border-radius:8px}
+ #header{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.94);
+   backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+ #header nav{max-width:var(--maxw);margin:0 auto;padding:.6rem 1rem;
+   display:flex;align-items:center;gap:.35rem;flex-wrap:wrap}
+ .brand{font-weight:800;font-size:1.1rem;letter-spacing:-.02em;color:var(--brand-ink);
+   margin-right:auto;padding:.3rem .4rem}
+ .brand:hover{text-decoration:none}
+ .brand .dot{color:var(--accent)}
+ .navlink{padding:.4rem .65rem;border-radius:999px;color:var(--ink);font-weight:500}
+ .navlink:hover{background:var(--brand-soft);text-decoration:none}
+ [data-testid='current-user']{font-weight:600;color:var(--brand-ink);padding:0 .3rem}
+ main{max-width:var(--maxw);margin:0 auto;padding:1.5rem 1rem 3.5rem}
+ h1{font-size:1.55rem;line-height:1.2;margin:.2rem 0 1.1rem;letter-spacing:-.02em}
+ .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
+   box-shadow:var(--shadow);padding:1.1rem 1.2rem;margin:0 0 1rem}
+ .auth{max-width:420px}
+ .stack{display:flex;flex-direction:column;gap:.85rem}
+ .search{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+   gap:.85rem;align-items:end}
+ .field{display:flex;flex-direction:column;gap:.35rem;margin:0}
+ .field-label{font-size:.82rem;font-weight:600;color:var(--muted)}
+ input,select,button{font:inherit}
+ input,select{width:100%;padding:.6rem .65rem;border:1px solid var(--line);
+   border-radius:10px;background:#fff;color:var(--ink)}
+ input:hover,select:hover{border-color:#d2ccbf}
+ input:focus,select:focus{border-color:var(--brand);outline:none;
+   box-shadow:0 0 0 3px rgba(31,95,74,.15)}
+ button{cursor:pointer}
+ .btn{background:var(--brand);color:#fff;border:1px solid var(--brand);
+   padding:.6rem 1rem;border-radius:10px;font-weight:600;transition:background .12s}
+ .btn:hover{background:var(--brand-ink)}
+ .btn.secondary{background:#fff;color:var(--brand-ink);border-color:var(--line);font-weight:500}
+ .btn.secondary:hover{background:var(--brand-soft)}
+ .btn.danger{background:#fff;color:var(--danger);border-color:var(--danger-line);font-weight:600}
+ .btn.danger:hover{background:var(--danger-soft)}
+ [data-testid='availability-grid']{margin-top:1.25rem;display:flex;flex-direction:column;gap:.55rem}
+ .slot{display:grid;grid-template-columns:3.6rem 1fr;gap:.6rem;align-items:center}
+ .slot-time{font-variant-numeric:tabular-nums;font-weight:600;color:var(--muted);font-size:.85rem}
+ .slot-cells{display:flex;flex-wrap:wrap;gap:.45rem}
+ .cell{padding:.45rem .7rem;border:1px solid var(--line);background:#fff;
+   border-radius:9px;color:var(--ink);font-size:.9rem;transition:background .12s,border-color .12s}
+ .cell[data-available='false']{background:#f1efe9;color:#a9a79f;border-color:#e6e2d9;cursor:not-allowed}
+ .cell[data-available='true']{background:var(--ok-soft);border-color:var(--ok-line);
+   color:#155c3a;font-weight:600}
+ .cell[data-available='true']:hover{background:#d8ede0;border-color:var(--ok)}
+ .cell.combo{background:var(--brand-soft);border-color:#c4ddd2;color:var(--brand-ink)}
+ .cell.combo:hover{background:#d5e8df}
+ [data-testid='no-slots']{color:var(--muted);padding:1.1rem 1.2rem;background:var(--surface);
+   border:1px dashed var(--line);border-radius:var(--radius);margin-top:1.25rem}
+ [data-testid='booking-form'],[data-testid='confirmation']{margin-top:1.25rem;
+   border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);
+   box-shadow:var(--shadow);padding:1rem 1.1rem}
+ [data-testid='booking-summary']{font-weight:600;margin-bottom:.75rem;color:var(--brand-ink)}
+ [data-testid='confirmation']{border-color:var(--ok-line);background:var(--ok-soft)}
+ [data-testid='confirmation-reference']{font-size:1.2rem;font-weight:800;
+   color:var(--brand-ink);letter-spacing:.02em;margin-bottom:.35rem}
+ [data-testid='auth-error'],[data-testid='booking-error'],[data-testid='reservation-error']{
+   display:block;background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger-line);
+   border-radius:10px;padding:.6rem .75rem;margin:.7rem 0;font-weight:500}
+ [data-testid='booking-uncertain']{display:block;background:var(--warn-soft);color:var(--warn);
+   border:1px solid var(--warn-line);border-radius:10px;padding:.6rem .75rem;margin:.7rem 0;font-weight:500}
+ [data-testid='reservation-detail']{border:1px solid var(--line);border-radius:var(--radius);
+   background:var(--surface);box-shadow:var(--shadow);padding:1rem 1.1rem;margin-top:1.1rem}
+ [data-testid='reservation-status']{display:inline-block;font-size:.75rem;font-weight:700;
+   letter-spacing:.03em;padding:.22rem .6rem;border-radius:999px;background:var(--brand-soft);
+   color:var(--brand-ink);margin-bottom:.5rem}
+ [data-testid='reservation-tables']{color:var(--muted)}
+ @media (max-width:420px){
+   main{padding:1rem .8rem 2.5rem}
+   .slot{grid-template-columns:3rem 1fr;gap:.45rem}
+   .cell{padding:.4rem .55rem;font-size:.85rem}
+ }
 </style>
 </head>
 <body>
@@ -2586,12 +2675,16 @@ function defaultDate(){
 
 function renderHeader(){
   const h = document.getElementById('header');
-  let html = '<nav><a href="/">Search</a> <a href="/lookup">Lookup</a>';
+  let html = '<nav>' +
+    '<a class="brand" href="/">Tablekeeper<span class="dot">.</span></a>' +
+    '<a class="navlink" href="/">Search</a>' +
+    '<a class="navlink" href="/lookup">Lookup</a>';
   if (currentUser) {
-    html += ' <span data-testid="current-user">' + esc(currentUser.display_name) + '</span>';
-    html += ' <button data-testid="logout-button">Log out</button>';
+    html += '<span data-testid="current-user">' + esc(currentUser.display_name) + '</span>';
+    html += '<button class="btn secondary" data-testid="logout-button">Log out</button>';
   } else {
-    html += ' <a href="/login">Log in</a> <a href="/signup">Sign up</a>';
+    html += '<a class="navlink" href="/login">Log in</a>' +
+            '<a class="navlink" href="/signup">Sign up</a>';
   }
   html += '</nav>';
   h.innerHTML = html;
@@ -2625,13 +2718,15 @@ function clearAuthError(){
 
 function renderLogin(){
   document.getElementById('app').innerHTML =
+    '<div class="card auth">' +
     '<h1>Log in</h1>' +
-    '<form id="login-form">' +
-    '<label>Email <input type="email" data-testid="login-email"></label>' +
-    '<label>Password <input type="password" data-testid="login-password"></label>' +
-    '<button type="submit" data-testid="login-submit">Log in</button>' +
+    '<form id="login-form" class="stack">' +
+    '<label class="field"><span class="field-label">Email</span><input type="email" autocomplete="email" data-testid="login-email"></label>' +
+    '<label class="field"><span class="field-label">Password</span><input type="password" autocomplete="current-password" data-testid="login-password"></label>' +
+    '<button class="btn" type="submit" data-testid="login-submit">Log in</button>' +
     '</form>' +
-    '<div id="auth-error-slot"></div>';
+    '<div id="auth-error-slot"></div>' +
+    '</div>';
   document.getElementById('login-form').onsubmit = async function(e){
     e.preventDefault();
     clearAuthError();
@@ -2644,14 +2739,16 @@ function renderLogin(){
 
 function renderSignup(){
   document.getElementById('app').innerHTML =
+    '<div class="card auth">' +
     '<h1>Sign up</h1>' +
-    '<form id="signup-form">' +
-    '<label>Email <input type="email" data-testid="signup-email"></label>' +
-    '<label>Password <input type="password" data-testid="signup-password"></label>' +
-    '<label>Display name <input data-testid="signup-display-name"></label>' +
-    '<button type="submit" data-testid="signup-submit">Sign up</button>' +
+    '<form id="signup-form" class="stack">' +
+    '<label class="field"><span class="field-label">Email</span><input type="email" autocomplete="email" data-testid="signup-email"></label>' +
+    '<label class="field"><span class="field-label">Password</span><input type="password" autocomplete="new-password" data-testid="signup-password"></label>' +
+    '<label class="field"><span class="field-label">Display name</span><input autocomplete="name" data-testid="signup-display-name"></label>' +
+    '<button class="btn" type="submit" data-testid="signup-submit">Sign up</button>' +
     '</form>' +
-    '<div id="auth-error-slot"></div>';
+    '<div id="auth-error-slot"></div>' +
+    '</div>';
   document.getElementById('signup-form').onsubmit = async function(e){
     e.preventDefault();
     clearAuthError();
@@ -2667,12 +2764,14 @@ function renderSignup(){
 
 function renderSearch(){
   document.getElementById('app').innerHTML =
+    '<div class="card">' +
     '<h1>Find a table</h1>' +
     '<div class="search">' +
-    '<label>Restaurant <select data-testid="restaurant-select"></select></label>' +
-    '<label>Date <input type="date" data-testid="date-input"></label>' +
-    '<label>Party size <input type="number" min="1" value="2" data-testid="party-size-input"></label>' +
-    '<button data-testid="search-button">Search</button>' +
+    '<label class="field"><span class="field-label">Restaurant</span><select data-testid="restaurant-select"></select></label>' +
+    '<label class="field"><span class="field-label">Date</span><input type="date" data-testid="date-input"></label>' +
+    '<label class="field"><span class="field-label">Party size</span><input type="number" min="1" value="2" data-testid="party-size-input"></label>' +
+    '<button class="btn" data-testid="search-button">Search</button>' +
+    '</div>' +
     '</div>' +
     '<div id="auth-error-slot"></div>' +
     '<div id="grid-area"></div>' +
@@ -2730,8 +2829,11 @@ function renderGrid(detail, avail, party){
     const row = document.createElement('div');
     row.className = 'slot';
     const label = document.createElement('span');
+    label.className = 'slot-time';
     label.textContent = time;
     row.appendChild(label);
+    const cells = document.createElement('div');
+    cells.className = 'slot-cells';
     const available = {};
     (slot.available_table_ids || []).forEach(function(id){ available[id] = true; });
     tables.forEach(function(t){
@@ -2744,7 +2846,7 @@ function renderGrid(detail, avail, party){
         if (cell.getAttribute('data-available') !== 'true') { return; }
         openBooking(detail, [t.id], time, slot.starts_at_local, party);
       };
-      row.appendChild(cell);
+      cells.appendChild(cell);
     });
     (slot.available_options || []).forEach(function(opt){
       if (!opt.table_ids || opt.table_ids.length < 2) { return; }
@@ -2755,8 +2857,9 @@ function renderGrid(detail, avail, party){
       cell.className = 'cell combo';
       cell.textContent = ids.map(function(id){ return labelOf(tables, id); }).join('+');
       cell.onclick = function(){ openBooking(detail, ids, time, slot.starts_at_local, party); };
-      row.appendChild(cell);
+      cells.appendChild(cell);
     });
+    row.appendChild(cells);
     grid.appendChild(row);
   });
   area.innerHTML = '';
@@ -2770,12 +2873,13 @@ function openBooking(detail, tableIds, time, startsLocal, party){
   area.innerHTML = '';
   const form = document.createElement('div');
   form.setAttribute('data-testid', 'booking-form');
+  form.className = 'stack';
   const labels = tableIds.map(function(id){ return labelOf(detail.tables, id); }).join(', ');
   form.innerHTML =
     '<div data-testid="booking-summary">' + esc(detail.name) + ' — Table ' + esc(labels) +
     ' at ' + esc(time) + '</div>' +
-    '<label>Party size <input type="number" min="1" data-testid="booking-party-size" value="' + party + '"></label>' +
-    '<button data-testid="booking-submit">Book</button>';
+    '<label class="field"><span class="field-label">Party size</span><input type="number" min="1" data-testid="booking-party-size" value="' + party + '"></label>' +
+    '<button class="btn" data-testid="booking-submit">Book</button>';
   area.appendChild(form);
   const size = $('booking-party-size');
   size.oninput = function(){
@@ -2849,12 +2953,14 @@ function renderConfirmation(data){
 
 function renderLookup(){
   document.getElementById('app').innerHTML =
+    '<div class="card auth">' +
     '<h1>Look up a booking</h1>' +
-    '<form id="lookup-form">' +
-    '<label>Reference <input data-testid="lookup-reference-input"></label>' +
-    '<button type="submit" data-testid="lookup-submit">Look up</button>' +
+    '<form id="lookup-form" class="search">' +
+    '<label class="field"><span class="field-label">Reference</span><input data-testid="lookup-reference-input"></label>' +
+    '<button class="btn" type="submit" data-testid="lookup-submit">Look up</button>' +
     '</form>' +
-    '<div data-testid="lookup-result"></div>';
+    '<div data-testid="lookup-result"></div>' +
+    '</div>';
   document.getElementById('lookup-form').onsubmit = async function(e){
     e.preventDefault();
     await doLookup();
@@ -2880,7 +2986,7 @@ async function renderReservation(out, data){
     '<div data-testid="reservation-status">' + esc(data.status) + '</div>' +
     '<div data-testid="reservation-tables">' + esc(labels) + '</div>';
   if (data.status === 'confirmed') {
-    html += '<button data-testid="reservation-cancel-button">Cancel</button>';
+    html += '<button class="btn danger" data-testid="reservation-cancel-button">Cancel</button>';
   }
   html += '</div>';
   out.innerHTML = html;
