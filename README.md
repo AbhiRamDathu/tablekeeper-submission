@@ -1,163 +1,277 @@
-# Tablekeeper submission — the **tablekeeper** track
+# Tablekeeper — ProofForge Dark Factory
 
-A Band Desktop software factory (four coding-agent seats) and the service that
-factory built across the track's four stages. The build is complete through
-Stage 4; each stage folder is a self-contained, buildable service that solves its
-own stage and carries every earlier stage forward.
+**A specification-driven software factory built with BAND Desktop for the WeAreDevelopers × BAND Dark Factory Hackathon.**
 
-| | |
+ProofForge is an evidence-gated, multi-agent software factory. It coordinates specialized coding-agent seats to plan work, implement bounded changes, challenge results, repair defects, and independently verify software against a written specification.
+
+Its demonstration application is **Tablekeeper**, a restaurant reservation service built around a demanding engineering invariant:
+
+> A reservation system must preserve correctness when requests race, clients retry operations, state changes, and local times cross daylight-saving transitions.
+
+ProofForge's goal is not simply to generate code. It is to make software delivery inspectable: decisions, implementation changes, reviews, test results, defects, and accepted revisions should leave a trace that another developer can examine.
+
+---
+
+## 1. The problem we address
+
+Restaurant reservations appear straightforward until real-world conditions interact:
+
+- Two customers attempt to reserve overlapping intervals.
+- A client retries a request after losing the response.
+- A reservation is moved or amended while another operation is in progress.
+- A restaurant operates in a time zone with daylight-saving transitions.
+- State must be exported, imported, and restored without silently corrupting existing records.
+- A validation failure must not leave partially applied changes.
+
+These are not merely endpoint-design problems. They are correctness, consistency, concurrency, and recovery problems.
+
+Tablekeeper provides the application challenge. ProofForge provides the process for engineering and verifying the solution.
+
+## 2. Two connected deliverables
+
+| Deliverable | Purpose |
 |---|---|
-| **Track** | `tablekeeper` |
-| **Team** | Tablekeeper Band — room owner `@velishalalingaraju` |
-| **Seats** | `@architect` (lead/coordinator), `@implementer`, `@reviewer`, `@quality-assurance` |
-| **Harness** | OpenCode, model `opencode/big-pickle` on every seat |
-| **Implementation** | Python 3.12, standard library only (no third-party runtime dependency) |
-| **Public remote** | `https://github.com/AbhiRamDathu/tablekeeper-submission` |
+| **ProofForge** | A reusable factory for specification-driven planning, implementation, review, verification, and defect recovery. |
+| **Tablekeeper** | A restaurant reservation service used to exercise the factory against concrete API and state-management requirements. |
 
-## How to read this repository
+The application is the product of the factory. The factory is the engineering system that should make the product reproducible, reviewable, and maintainable.
 
-```text
-README.md          this file: team, track, how to read and reproduce the result
-FACTORY.md         the factory: seats, design choices, costs, failure handling
-mandates/          one mandate per seat, named after the seat as the room shows it
-room.json          the room, downloaded from Band as a full session (human-supplied)
-stage-1/           complete, buildable service — the stage-1 specification
-stage-2/           stage-1 carried forward and extended to the stage-2 specification
-stage-3/           stage-2 carried forward and extended to the stage-3 specification
-stage-4/           stage-3 carried forward and extended to the stage-4 specification
-docs/              architect/session notes and the derived work-item registers
+## 3. ProofForge architecture
+
+ProofForge separates responsibilities so that producing a change is not the same as accepting it.
+
+### Architect — planning and coordination
+
+- Inspects the repository and the complete specification.
+- Establishes the existing behavior and identifies specification gaps.
+- Breaks work into bounded, verifiable tasks.
+- Assigns ownership and defines acceptance criteria.
+- Coordinates handoffs and tracks evidence.
+
+### Implementer — scoped engineering
+
+- Implements assigned changes against the specification.
+- Preserves existing behavior unless a change is justified.
+- Produces focused diffs and test evidence.
+- Reports the exact revision and any unresolved defects.
+
+### Reviewer — independent challenge
+
+- Inspects the implementation and the exact revision under review.
+- Checks specification compliance rather than accepting implementation claims.
+- Investigates edge cases, incorrect status codes, ordering, timestamps, and state transitions.
+- Rejects defects with reproducible evidence.
+
+### Quality Assurance — independent verification
+
+- Exercises externally observable behavior.
+- Tests failure paths and boundary conditions.
+- Checks whether the evidence actually supports the claimed result.
+- Verifies fixes without relying solely on the implementer's report.
+
+The intended workflow is:
+
+**Specify → Decompose → Implement → Review → Repair → Verify → Accept**
+
+A change is not accepted merely because an agent says it is finished. Acceptance requires evidence appropriate to the change.
+
+## 4. What makes the factory reusable?
+
+ProofForge is designed around general engineering responsibilities rather than application-specific instructions.
+
+Its intended reusable principles are:
+
+- **Specification first:** derive obligations from the requirements before changing code.
+- **Bounded ownership:** give each seat a defined task and explicit completion criteria.
+- **Independent review:** separate implementation from acceptance.
+- **Evidence-bearing handoffs:** report revisions, commands, observed results, and remaining risks.
+- **Controlled repair:** route concrete defects back to the responsible seat.
+- **History preservation:** retain the relationship between room activity, Git commits, tests, and decisions.
+- **Honest reporting:** distinguish verified results from untested assumptions and environmental blockers.
+
+These principles are intended to apply beyond restaurant reservations. The track-specific requirements belong in the task specification, not in the factory's generic operating mandates.
+
+## 5. Tablekeeper engineering
+
+The service is implemented in Python using the standard library, including an HTTP server and SQLite persistence.
+
+The inspected implementation includes the following engineering mechanisms:
+
+| Area | Implementation approach |
+|---|---|
+| HTTP service | `ThreadingHTTPServer` with explicit request routing |
+| Persistence | SQLite database with WAL journaling |
+| Write transactions | `BEGIN IMMEDIATE` for serialized write operations |
+| Reservation identity | Restaurant-scoped record identifiers |
+| Fixture ordering | Explicit ordinal values for deterministic fixture ordering |
+| Authentication | PBKDF2-HMAC-SHA256 password derivation and opaque bearer tokens |
+| Idempotency | Persisted receipts keyed by request identity and operation |
+| Time handling | IANA time zones and explicit handling of daylight-saving transitions |
+| Interval conflicts | Half-open intervals, `[start, end)`, compared in absolute time |
+| Test isolation | Real HTTP service exercised against temporary databases |
+
+These mechanisms are engineering choices, not proof that every requirement has passed. Their correctness must be established through specification-based tests and reproducible verification.
+
+### Important correctness properties
+
+**No overlapping reservations**
+
+Concurrent operations must not create conflicting bookings for the same table. Transaction boundaries and interval arithmetic are part of the solution, but concurrency must still be tested under realistic contention.
+
+**Safe retries**
+
+Repeated requests must not accidentally duplicate successful operations. Idempotency behavior must be checked for both identical and conflicting request payloads.
+
+**Atomic state changes**
+
+Multi-item operations and imports must either satisfy their required invariants or fail without leaving partially applied state.
+
+**Correct time semantics**
+
+Local wall-clock times must be interpreted in the restaurant's time zone. Nonexistent local times, repeated local times, and interval boundaries require explicit handling.
+
+**Predictable API contracts**
+
+Response envelopes, field types, ordering, status codes, and error messages are part of the specification—not cosmetic implementation details.
+
+## 6. Verification philosophy
+
+ProofForge treats verification as a separate engineering responsibility.
+
+The verification process is intended to cover:
+
+1. Specification-derived acceptance criteria.
+2. API behavior and response contracts.
+3. Invalid inputs and boundary conditions.
+4. Concurrent operations and transaction safety.
+5. Idempotency and retry behavior.
+6. Time-zone and daylight-saving behavior.
+7. State export/import and failure recovery.
+8. Independent review of the exact Git revision.
+9. Clean-container startup and reproducibility.
+10. Evidence that distinguishes passing checks from unresolved defects.
+
+A test suite passing is meaningful only when the test count, scope, environment, and actual outcome are recorded. Passing the supplied tests alone does not establish complete specification compliance.
+
+## 7. Repository map
+
+The repository should be read as two related artifacts: the factory's evidence and the application it produces.
+
+| Path | Purpose |
+|---|---|
+| `stage-1/` | Current tracked application stage |
+| `stage-1/app/main.py` | HTTP routing, request validation, and service behavior |
+| `stage-1/app/store.py` | Persistence and state operations |
+| `stage-1/app/auth.py` | Authentication functionality |
+| `stage-1/app/tz.py` | Time-zone handling |
+| `stage-1/app/intervals.py` | Reservation interval calculations |
+| `stage-1/tests/` | Automated behavioral and specification tests |
+| `stage-1/RUN.md` | Stage-specific execution instructions |
+| `stage-1/Dockerfile` | Container build definition |
+| `REQUIREMENTS.md` | Requirement traceability checklist |
+| `PLAN.md` | Engineering plan and work tracking |
+
+**Repository scope:** the latest audited snapshot contained `stage-1/` as its only stage directory. The presence of functionality associated with later requirements inside that directory must not be confused with a separately completed, independently buildable Stage 2, 3, or 4 deliverable.
+
+The full submission structure, room export, factory documentation, mandates, and stage folders should be checked against the official participant guide and the actual repository before any completeness claim is made.
+
+## 8. Running and testing the current stage
+
+### Prerequisites
+
+- Python 3.12 or later
+- Git
+- Docker for the official container verification workflow
+
+### Run the service
+
+From the repository root, follow the instructions in `stage-1/RUN.md`. The application is designed to listen on the configured `PORT`.
+
+### Run the automated tests
+
+From the `stage-1/` directory:
+
+```bash
+python -m unittest discover -s tests -t .
 ```
 
-Read `FACTORY.md` first if you want to know how the work was organised;
-`mandates/` if you want to know what each seat is allowed to do; the stage
-folders if you want the service.
+Record the full test count and all failures, errors, and skips. Do not report a passing gate when the command exits unsuccessfully.
 
-Each stage folder is **self-contained**: it has its own `Dockerfile`, its own
-`RUN.md`, its own `app/` package, its own `tests/`, and it solves its own stage
-and no later one. `stage-N/` is graded against suites 1..N, so a stage that broke
-an earlier stage does not count.
+### Container verification
 
-## What each stage adds
+The Dockerfile must be built and the resulting service tested from a clean environment. A successful unit-test run or static packaging test is not a substitute for a successful container build and HTTP smoke test.
 
-| Stage | Folder | Adds on top of the previous stage |
-|---|---|---|
-| 1 | `stage-1/` | Reservations API: restaurants/availability, signup/login, bookings, cancel, PATCH, atomic multi-booking moves, idempotency, DST-aware local times, export/import. |
-| 2 | `stage-2/` | Browser client (`/`, `/signup`, `/login`, `/lookup`), combined-table (`combinable` pair) bookings, `available_options`, on-grid combination cells, competing-client / lost-response recovery. |
-| 3 | `stage-3/` | `explain=true` availability explanations, reservation `history` and `decision`, manager policies (`policy_version`, effective dates), `revision` + `accepted_terms` on every reservation, `expected_revision`/`stale_revision`, recurring `POST /series`, `/series/{id}`, collective moves under policies. |
-| 4 | `stage-4/` | Manager `POST /restaurants/{id}/replans` preview (deterministic minimal-cost re-seating after a closure) and `.../apply` (atomic, `stale_plan`, `plan_already_applied`, `reassigned` history), and `POST /series/{series_id}/amend`. |
+See the official [Dark Factory participant guide](https://github.com/band-ai/dark-factory-wearedevs/blob/main/docs/participant-guide.md) for the required harness and isolated-stage verification workflow.
 
-## Running a stage
+## 9. Verification status and known limitations
 
-Every stage folder runs the same way.
+Engineering credibility requires reporting the state of the artifact as measured, not as hoped for.
 
-```sh
-cd stage-4
-python -m app.main            # serves http://127.0.0.1:8080, /health answers {"status":"ok"}
-```
+**Last recorded verification snapshot: 7 October 2026.**
 
-The state file defaults to `tablekeeper.sqlite` next to `app/` and can be pointed
-elsewhere with the `TABLEKEEPER_DB` environment variable; the port comes from
-`PORT` (default `8080`). Full instructions, including the container build, are in
-each stage's `RUN.md`.
+| Check | Recorded result |
+|---|---|
+| Standard-library unit suite | 262 tests: 9 failures, 1 error, 1 skipped |
+| Specification gate | Failed |
+| Official Stage 1 harness | 92 passed, 28 failed out of 120 |
+| Docker build and clean-container verification | Not run; Docker was unavailable on the audited host |
+| Separate stage directories | Only `stage-1/` was present in the audited repository snapshot |
+| Credential protection | An untracked `agent_config.yaml` required `.gitignore` protection and credential review |
 
-## Checking a stage the way the judges do
+These results are historical evidence from the supplied audit reports, not a claim about a later revision. A subsequent revision should replace this table only after the corresponding checks have been rerun and their outputs recorded.
 
-From the challenge package directory (`dark-factory-wearedevs-main/`):
+The principal outstanding work identified by the audits included reservation slot-grid and opening-hours validation, response envelopes and ordering, required response fields, validation status codes, availability time-zone metadata, import/replacement behavior, and test-harness cleanup.
 
-```sh
-# offline gates 1, 2 and the mandate half of gate 4 — no Docker needed
-python -m harness check <this-repository> --track tablekeeper
+Container verification, the full required submission structure, and independent acceptance of repaired changes also remained to be established in those reports.
 
-# gate 3 — builds the container and runs the shipped suites (needs Docker)
-python -m harness run --track tablekeeper --repo <this-repository> --stage 4 --mode isolated
-python -m harness run --track tablekeeper --repo <this-repository> --all
-```
+## 10. Evidence and reproducibility
 
-Without Docker, the same shipped suites can be run against a locally started
-service, which is what this factory used while developing:
+The repository and factory records should make it possible to answer four questions:
 
-```sh
-# start the stage folder you want to grade
-cd stage-4 && PORT=8099 TABLEKEEPER_DB=$TEMP/tk.sqlite python -m app.main &
+- **What was required?** Inspect the written specification and requirement traceability.
+- **What changed?** Inspect the relevant commit and its diff.
+- **How was it challenged?** Inspect the review findings, test evidence, and handoff records.
+- **Was it accepted?** Inspect the independent verification result for the exact revision.
 
-# run that stage's suite and every earlier one against it
-python -m harness run --track tablekeeper \
-  --base-url http://127.0.0.1:8099 --stages 1 2 3 4 --out <fresh-output-directory>
-```
+The official submission requires a complete, unchanged BAND room export and the corresponding Git history. These are primary evidence of collaboration; descriptive documentation alone cannot establish that agents performed the work or that a review changed an implementation.
 
-A `stage-N/` folder is graded against every suite up to N, so `stage-4/` must
-pass suites 1, 2, 3 **and** 4 to count as a completed stage 4.
+Secrets must not be published in source files, configuration, or room exports. The room export should be inspected for private values before being committed.
 
-## Verification record
+## 11. Alignment with the judging rubric
 
-Measured on this host (Windows, Python 3.12.10, **no Docker**). Each number is
-reproducible from the command named beside it.
+The project is designed around the competition's three criteria:
 
-| Check | Result | How to reproduce |
-|---|---|---|
-| Offline gates (`harness check`) | 1 problem: `room.json` missing (human-supplied; see below) | `python -m harness check <repo> --track tablekeeper` |
-| Shipped suite, stage 1 | **120 collected / 120 passed / 0 failed / 0 skipped** | `--base-url <stage-1> --stages 1` |
-| Shipped suite, stage 2 | **25 collected / 25 passed / 0 failed** (8 API + 17 UI) | `--base-url <stage-2> --stages 2` |
-| Shipped suite, stage 3 | **7 collected / 7 passed / 0 failed** | `--base-url <stage-3> --stages 3` |
-| Shipped suite, stage 4 | **6 collected / 6 passed / 0 failed** | `--base-url <stage-4> --stages 4` |
-| Full chain against `stage-4/` | **stage 1 + 2 + 3 + 4 all green** (120 + 25 + 7 + 6) | `--base-url <stage-4> --stages 1 2 3 4` |
-| Stage-1 in-folder suite | **272 tests green, 0 failures, 0 errors, 0 skipped** | `cd stage-1 && python -m unittest discover -s tests -t .` |
-| Container build (all stages) | **UNVERIFIED — Docker is not installed on this host** | `docker build stage-4` |
+**Factory — 50%**
 
-The shipped suites are a **partial** sample of the grading set; the stage folders
-also carry the team's larger in-folder spec suites (see each `RUN.md`). A run
-reporting `Ran 0 tests` is not a pass.
+Reusable mandates, bounded responsibilities, specification-derived tasks, evidence-bearing handoffs, independent review, failure recovery, and reproducible setup.
 
-## Reproducing the final result
+**App — 25%**
 
-```sh
-git clone https://github.com/AbhiRamDathu/tablekeeper-submission
-cd tablekeeper-submission
-git log --oneline                     # the agent-generated history, oldest → newest
+Reservation correctness, consistent API contracts, state integrity, concurrency safety, retry handling, and correct time-zone behavior.
 
-# every stage starts and serves /health
-for s in 1 2 3 4; do
-  (cd stage-$s && PORT=8080 python -m app.main &) ; sleep 2
-  curl -s localhost:8080/health ; kill %1 2>/dev/null || true
-done
-```
+**Agent Teamwork — 25%**
 
-Then run the shipped suites as shown above. The default branch (`main`) holds
-this complete Stage-4 submission.
+Observable collaboration among distinct BAND seats, reciprocal handoffs, review that challenges actual changes, and a Git history traceable to the room.
 
-## Architecture
+These are design goals, not a declaration of a particular score. Actual results depend on the committed artifacts, stage completion, full judging checks, and the evidence available to the judges.
 
-Every stage is one process: a pure-standard-library HTTP service (`app/main.py`
-routes, `app/store.py` is the SQLite state layer, `app/tz.py` resolves local
-times against IANA zones including DST gaps/repeats, `app/intervals.py` is
-half-open `[start, end)` occupancy arithmetic, `app/auth.py` is the password
-hashing and tokens). State is a single SQLite file; writes take `BEGIN IMMEDIATE`
-so concurrent requests serialise, and idempotency receipts are stored with each
-successful write so a retry replays the original response. `app/store.py` also
-owns export/import, which is how a later stage accepts an earlier stage's state.
+## 12. Project information
 
-See `FACTORY.md` for the production process; `docs/work-items-stage-{2,3,4}.md`
-for the specification citations behind each stage; `docs/architect-handoff-notes.md`
-for the session handoff record.
+- **Project:** Tablekeeper — ProofForge Dark Factory
+- **Track:** Tablekeeper — restaurant reservation system
+- **Platform:** BAND Desktop
+- **Event:** WeAreDevelopers × BAND Dark Factory Hackathon
+- **Submission page:** [Tablekeeper — ProofForge Dark Factory](https://lablab.ai/ai-hackathons/wearedevelopers-hackathon/proofforge/tablekeeper-proofforge-dark-factory)
+- **Rules and verification instructions:** [Official participant guide](https://github.com/band-ai/dark-factory-wearedevs/blob/main/docs/participant-guide.md)
 
-## room.json
+---
 
-`room.json` is the Band room downloaded as a **full session** — it is the only
-artifact no seat can produce, because Band offers it through the human console,
-not the agent API. To add it:
+## Closing principle
 
-> Open the room in Band Desktop → room `⋮` menu → **Open in Band** → `⋮` →
-> **Download** → **Download full session** → save unchanged as `room.json` at the
-> repository root.
+ProofForge is built around one principle:
 
-`python -m harness check` reports exactly `room.json is missing` until it is
-added; every other offline gate passes without it.
+**Software should earn acceptance through evidence, not confidence.**
 
-## Credentials
+The long-term goal is a reusable factory in which specialized agents produce software, independently challenge it, repair concrete defects, and leave enough reproducible evidence for another engineer to understand and verify the result.
 
-`.env` and `agent_config.yaml` are local runtime configuration and are
-gitignored; they are not part of the submission. `python -m harness check` scans
-the repository for credential shapes and fails on any it finds. If you find a
-credential-shaped string anywhere in this repository, treat it as compromised and
-rotate it. `room.json` from Band contains the room's full event log — review it
-before publishing.
+The quality of that factory is measured not by how confidently it describes itself, but by what it builds, what it catches, what it repairs, and what an independent reviewer can reproduce.
